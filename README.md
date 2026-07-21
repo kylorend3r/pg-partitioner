@@ -23,12 +23,12 @@ Not a fit if you're already deep on pg_partman with a stable setup and don't nee
 
 | | pg_partman | pg-partitioner |
 |---|---|---|
-| Interface | SQL functions only | CLI (`inspect`, `plan`, `apply`, `doctor`, ...) |
+| Interface | SQL functions only | CLI (`inspect`, `plan`, `apply`, `maintain`, ...) |
 | Preview before changing anything | No — config changes take effect on the next scheduled run | `plan` shows exactly what will run, `apply` refuses to proceed if the schema drifted since |
 | Destructive-action confirmation | A parameter that must equal the string `"yes"` | Confirmation showing actual row counts and table names |
 | Lock/timeout discipline | Left to the operator's maintenance-window judgment | `lock_timeout`/`statement_timeout` + backoff-retry on every DDL action, non-negotiably |
 | Timezone mismatches | Documented as a risk | Detected and surfaced as a warning before `apply` runs |
-| 63-byte identifier truncation collisions | Documented as a risk ("keep names short") | Checked and rejected at `plan` time |
+| 63-byte identifier truncation collisions | Documented as a risk ("keep names short") | Checked and rejected at `plan` time — table names are capped at 60 characters, leaving headroom for derived partition/index name suffixes |
 | Existing-table conversion | Manual `partition_data_*()` batch calls | Cutover-first via `ATTACH` — near-instant, safe for tables with ongoing updates |
 | Requires extension install | Yes (`CREATE EXTENSION`, BGW needs a restart) | No — connects like any client, works on managed providers without superuser |
 | Config format | Rows in `part_config` | YAML/JSON, git-reviewable |
@@ -69,10 +69,12 @@ export PG_PASSWORD=secret
 # Read-only — safe against production at any time
 pg-partitioner inspect              # what's partitioned, how, and any risk signals
 pg-partitioner explain              # the same thing, narrated in plain language
-pg-partitioner doctor               # health check with remediation suggestions
 
 # Plan before touching anything
-pg-partitioner plan --schema public --table events --output plan.json
+pg-partitioner plan --schema public --table events \
+  --strategy range --key created_at --interval "1 month" --premake 3 \
+  --start-date 2026-01-01 \
+  --output plan.json
 cat plan.json | jq '.'              # review the exact DDL and duration estimate
 
 # Dry-run, then apply for real
@@ -85,18 +87,88 @@ pg-partitioner maintain             # test manually first, then add to cron/syst
 
 See `QUICK_START.md` for a copy-paste command reference and `PRACTICAL_USE_CASES.md` for worked scenarios (staging validation, fleet monitoring, storage projection, blue/green strategy testing).
 
+## How to partition an existing table (date/range partitioning)
+
+This walks through converting a plain table — empty or already holding data — into a native `PARTITION BY RANGE` table keyed on a timestamp column, using the cutover-first strategy described above.
+
+```bash
+# 0. One-time setup: provision pg-partitioner's own config/state/audit tables,
+#    under a dedicated `partitioner` schema (created automatically)
+pg-partitioner install
+
+# 1. Compute a plan against the table you want to convert
+pg-partitioner plan --schema public --table events \
+  --strategy range --key created_at --interval "1 month" --premake 3 \
+  --retention-type months --retention-value 12 \
+  --start-date 2026-01-01 \
+  --output plan.json
+
+# 2. Review it — both the actions and any warnings
+cat plan.json | jq '.actions[].description'
+cat plan.json | jq '.warnings'
+```
+
+`--strategy`/`--key`/`--start-date` are required (`--start-date` mirrors nothing else — it's new: the minimum date, `YYYY-MM-DD`, to generate real per-period partitions from). `--interval`/`--premake` default to `"1 month"`/`3` if omitted. `--retention-type`/`--retention-value` are optional, but if you set one you must set the other — and whatever you pass here carries straight through to the config `apply` auto-registers, so you don't need a separate `register` call afterward just to set retention.
+
+**What `--start-date` actually controls**: data older than this date lands in one `MINVALUE`-bounded legacy partition (same as before); from `--start-date` forward through today plus `--premake` periods, you get a real, individually-named partition per period — not just one undifferentiated bucket for all pre-existing data. If that span is large (e.g. a `--start-date` years back with daily partitions), `plan` warns rather than blocking — check `.warnings` for a `large_partition_count` entry before you `apply`.
+
+A normal OLTP table (surrogate `id` primary key, not on `created_at`) will show a warning like:
+
+```
+unique_index_missing_partition_key: Unique index 'events_pkey' does not include all
+partition key columns (created_at). Unique constraints on partitioned tables must
+include the partition key.
+```
+
+This is expected, not a blocker — PostgreSQL requires unique indexes on a partitioned table to include the partition key, so `apply` automatically **skips** recreating that specific index on the new parent (everything else gets recreated) and leaves the original constraint enforced only on the now-archived legacy partition. If you need a true partition-wide unique constraint, that's a separate, not-yet-automated step (redefine the index to include `created_at`, e.g. `UNIQUE (id, created_at)`).
+
+```bash
+# 3. Dry-run, then apply for real
+pg-partitioner apply --plan-file plan.json --dry-run
+pg-partitioner apply --plan-file plan.json
+
+# 4. Confirm it worked
+pg-partitioner inspect --table events
+```
+
+`inspect` should report the table under **Configuration Reconciliation** as `Healthy` — meaning the registered config now matches what's actually in the live catalog.
+
+**What `apply` actually does**, in one short transaction at the core (the rest is cheap, non-blocking prep/cleanup around it):
+
+1. Adds a `NOT VALID` bounding `CHECK` constraint on `events` (bounded at `--start-date`, e.g. `created_at < '2026-01-01 00:00:00'`), then validates it separately — a non-blocking scan under `SHARE UPDATE EXCLUSIVE`, not the table's normal lock.
+2. Creates an empty partitioned shadow table with the same columns (`LIKE events INCLUDING DEFAULTS`).
+3. **The actual cutover** — one transaction: renames `events` → `events_legacy`, renames the shadow table into `events`, attaches `events_legacy` as a partition (covering everything older than `--start-date`). Fast because step 1 already proved the bound; existing rows are never copied.
+4. Creates a default partition, plus one real partition per period from `--start-date` through today plus `--premake` periods — each named `events_<start>_<end>` (e.g. `events_2026_07_22_2026_07_23`), not just a handful of forward-looking ones.
+5. Recreates non-unique indexes on the new parent (unique/PK indexes are skipped, per above).
+
+The table is also auto-registered into pg-partitioner's config at this point — no need to run `register` separately for a table converted this way. `register`/`unregister` exist for declaring management of a table partitioned by some *other* means, or for editing strategy/retention/premake after the fact:
+
+```bash
+pg-partitioner register --schema public --table events \
+  --strategy range --key created_at --interval "1 month" --premake 3 \
+  --retention-type months --retention-value 12
+```
+
+`maintain` now actually keeps registered tables' premake window topped up: each run recomputes "today's period through `--premake` periods ahead" and creates whatever's missing — including a partition you deleted by hand, not just extending the tail. **Known gap:** retention enforcement (dropping partitions older than the registered policy) is still a placeholder — `maintain` won't drop anything yet.
+
 ## Commands
 
 ```
 Read-only (always safe, no locks, no writes)
   inspect     current partitioning state — strategy, children, sizes, risk signals
   explain     the same state, as a plain-language narrative
-  doctor      health check against known-bad patterns, with remediation
   export      partitioning config to YAML/JSON for version control
+
+Setup
+  install     provision pg-partitioner's own config/state/audit tables (under the `partitioner` schema)
 
 Plan → apply
   plan        compute desired vs. current state, preflight-validate, write a checksummed plan
   apply       re-checksum live schema against the plan (refuses on drift), execute
+
+Configuration
+  register    declare a table as managed (or update its strategy/interval/retention/premake)
+  unregister  stop managing a table's partitioning configuration
 
 Automation
   maintain    premake future partitions + enforce retention across registered tables
@@ -129,7 +201,7 @@ See `docs/test_environment.md` for the full fixture catalog and what each one ex
 
 ## Status
 
-Phases 0–4 of the roadmap (`docs/roadmap.md`) are implemented: read-only discovery, guided plan/apply, operational guardrails (`doctor`, lock/timeout discipline, proactive risk detection), fleet-oriented maintenance, and early differentiation features (storage projection, blue/green strategy testing). See `COMPLETE_IMPLEMENTATION.md` for the phase-by-phase breakdown and what's still a stub pending integration testing against the fixture catalog.
+Phases 0–4 of the roadmap (`docs/roadmap.md`) are implemented: read-only discovery, guided plan/apply, operational guardrails (lock/timeout discipline, proactive risk detection), fleet-oriented maintenance, and early differentiation features (storage projection, blue/green strategy testing). See `COMPLETE_IMPLEMENTATION.md` for the phase-by-phase breakdown and what's still a stub pending integration testing against the fixture catalog.
 
 ## License
 

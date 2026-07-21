@@ -4,8 +4,9 @@ use std::path::PathBuf;
 
 use pg_partitioner::{
     config::ConfigResolver, connection::create_connection, credentials::resolve_password,
-    doctor, explain, inspect, logging::LogFormat, plan, apply, maintain, export, types::MigrationConfig,
-    types::PartitionKey, types::PartitionStrategy,
+    daemon::PartitionerDaemon, explain, inspect, install, logging::LogFormat, plan, apply,
+    maintain, export, registrations, types::MigrationConfig, types::PartitionKey,
+    types::PartitionStrategy, types::RetentionPolicy, types::RetentionType,
 };
 
 #[derive(Parser)]
@@ -80,17 +81,6 @@ enum Commands {
         table: Option<String>,
     },
 
-    /// Run health check and get remediation suggestions
-    Doctor {
-        /// Filter tables by name pattern
-        #[arg(long)]
-        table: Option<String>,
-
-        /// Output format: text, json
-        #[arg(long, default_value = "text")]
-        format: String,
-    },
-
     /// Plan a partitioning migration
     Plan {
         /// Schema name
@@ -100,6 +90,32 @@ enum Commands {
         /// Table name
         #[arg(long)]
         table: String,
+
+        /// range | list | hash
+        #[arg(long)]
+        strategy: String,
+
+        /// Partition key column(s), comma-separated for composite keys
+        #[arg(long, value_delimiter = ',', required = true)]
+        key: Vec<String>,
+
+        #[arg(long, default_value = "1 month")]
+        interval: String,
+
+        #[arg(long, default_value_t = 3)]
+        premake: usize,
+
+        /// days | months | years | count — must be paired with --retention-value
+        #[arg(long)]
+        retention_type: Option<String>,
+
+        #[arg(long)]
+        retention_value: Option<i32>,
+
+        /// Minimum date (YYYY-MM-DD) to start real per-period partitions
+        /// from; data older than this lands in one legacy partition instead
+        #[arg(long)]
+        start_date: String,
 
         /// Output plan to file
         #[arg(long)]
@@ -138,6 +154,112 @@ enum Commands {
         #[arg(long, default_value = "yaml")]
         format: String,
     },
+
+    /// Pre-check and install pg-partitioner's own metadata tables under the
+    /// `partitioner` schema (partitioner_registrations, partitioner_state,
+    /// partitioner_logbook)
+    Install {
+        /// Output format: text, json
+        #[arg(long, default_value = "text")]
+        format: String,
+    },
+
+    /// Declare a table as managed by pg-partitioner (or update its config)
+    Register {
+        #[arg(long)]
+        schema: String,
+
+        #[arg(long)]
+        table: String,
+
+        /// range | list | hash
+        #[arg(long)]
+        strategy: String,
+
+        /// Partition key column(s), comma-separated for composite keys
+        #[arg(long, value_delimiter = ',', required = true)]
+        key: Vec<String>,
+
+        #[arg(long, default_value = "1 month")]
+        interval: String,
+
+        #[arg(long, default_value_t = 3)]
+        premake: usize,
+
+        /// days | months | years | count — must be paired with --retention-value
+        #[arg(long)]
+        retention_type: Option<String>,
+
+        #[arg(long)]
+        retention_value: Option<i32>,
+    },
+
+    /// Stop managing a table's partitioning configuration
+    Unregister {
+        #[arg(long)]
+        schema: String,
+
+        #[arg(long)]
+        table: String,
+    },
+
+    /// Run as a long-lived daemon, sweeping premake + retention on a timer
+    /// instead of relying on an external scheduler (cron/systemd timer/k8s
+    /// CronJob). Intended to run under a supervisor such as systemd — see
+    /// docs/daemon.md and packaging/systemd/pg-partitioner.service.
+    Daemon {
+        /// Seconds between maintenance sweeps
+        #[arg(long, env = "PG_PARTITIONER_DAEMON_INTERVAL_SECS")]
+        interval_secs: Option<u64>,
+
+        /// Max seconds to wait for a maintenance cycle to finish, including
+        /// one already in flight when a shutdown signal arrives
+        #[arg(long, env = "PG_PARTITIONER_DAEMON_GRACEFUL_SHUTDOWN_SECS")]
+        graceful_shutdown_timeout_secs: Option<u64>,
+    },
+}
+
+fn build_retention_policy(
+    retention_type: Option<String>,
+    retention_value: Option<i32>,
+) -> Result<Option<RetentionPolicy>> {
+    match (retention_type, retention_value) {
+        (Some(t), Some(v)) => Ok(Some(RetentionPolicy {
+            policy_type: parse_retention_type(&t)?,
+            value: v,
+        })),
+        (None, None) => Ok(None),
+        _ => Err(anyhow::anyhow!(
+            "--retention-type and --retention-value must both be provided, or neither"
+        )),
+    }
+}
+
+fn parse_retention_type(s: &str) -> Result<RetentionType> {
+    match s.to_lowercase().as_str() {
+        "days" => Ok(RetentionType::Days),
+        "months" => Ok(RetentionType::Months),
+        "years" => Ok(RetentionType::Years),
+        "count" => Ok(RetentionType::Count),
+        other => Err(anyhow::anyhow!(
+            "Unknown retention type: {} (expected days, months, years, or count)",
+            other
+        )),
+    }
+}
+
+fn parse_start_date(s: &str) -> Result<chrono::NaiveDate> {
+    let date = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
+        .map_err(|e| anyhow::anyhow!("Invalid --start-date '{}' (expected YYYY-MM-DD): {}", s, e))?;
+
+    if date > chrono::Utc::now().date_naive() {
+        return Err(anyhow::anyhow!(
+            "--start-date '{}' is in the future; it must be today or earlier",
+            s
+        ));
+    }
+
+    Ok(date)
 }
 
 #[tokio::main]
@@ -174,6 +296,23 @@ async fn main() -> Result<()> {
         }
     }
 
+    // The daemon manages its own (reconnecting) connection internally, so it
+    // must not share the eagerly-created client below — that client would
+    // open one throwaway connection at startup before the daemon's own
+    // retry/backoff logic ever gets a chance to run, and gives it nothing
+    // to reconnect with if that one connection later drops.
+    if let Some(Commands::Daemon {
+        interval_secs,
+        graceful_shutdown_timeout_secs,
+    }) = cli.command
+    {
+        let daemon_config =
+            config_resolver.resolve_daemon_config(interval_secs, graceful_shutdown_timeout_secs);
+        let daemon = PartitionerDaemon::new(daemon_config, connection_config);
+        daemon.run().await?;
+        return Ok(());
+    }
+
     // Create database connection
     let client = create_connection(&connection_config).await?;
 
@@ -196,31 +335,32 @@ async fn main() -> Result<()> {
             println!("{}", explanation);
         }
 
-        Some(Commands::Doctor { table, format }) => {
-            let findings = doctor::run_diagnostic(&client, table.as_deref()).await?;
-
-            let output = match format.as_str() {
-                "json" => serde_json::to_string_pretty(&findings)?,
-                _ => doctor::format_findings(&findings),
-            };
-
-            println!("{}", output);
-        }
-
         Some(Commands::Plan {
             schema,
             table,
+            strategy,
+            key,
+            interval,
+            premake,
+            retention_type,
+            retention_value,
+            start_date,
             output,
             format,
         }) => {
-            // Create a basic migration config (Phase 1 simplified version)
+            let partition_strategy = PartitionStrategy::from_registration_str(&strategy)?;
+            let retention_policy = build_retention_policy(retention_type, retention_value)?;
+            let parsed_start_date = parse_start_date(&start_date)?;
+
             let config = MigrationConfig {
                 source_table: format!("{}.{}", schema, table),
-                partition_strategy: PartitionStrategy::Range,
-                partition_key: PartitionKey::single("created_at".to_string()),
-                interval: "1 month".to_string(),
-                premake_count: 3,
+                partition_strategy,
+                partition_key: PartitionKey::new(key),
+                interval,
+                premake_count: premake,
                 use_bulk_copy: false,
+                retention_policy,
+                start_date: Some(parsed_start_date.to_string()),
             };
 
             let plan_obj = plan::Planner::plan_migration(&client, &schema, &table, &config).await?;
@@ -232,6 +372,13 @@ async fn main() -> Result<()> {
             } else {
                 let plan_json = serde_json::to_string_pretty(&plan_obj)?;
                 println!("{}", plan_json);
+            }
+
+            if !plan_obj.warnings.is_empty() {
+                println!("\nWarnings:");
+                for warning in &plan_obj.warnings {
+                    println!("  - {}", warning);
+                }
             }
         }
 
@@ -264,8 +411,22 @@ async fn main() -> Result<()> {
                 let summary = maintain::Maintainer::run_maintenance_sweep(&client).await?;
                 println!(
                     "Maintenance complete: {} tables processed, {} partitions created, {} dropped",
-                    summary.tables_processed, summary.partitions_created, summary.partitions_dropped
+                    summary.tables_processed,
+                    summary.created_partitions.len(),
+                    summary.dropped_partitions.len()
                 );
+                if !summary.created_partitions.is_empty() {
+                    println!("Created:");
+                    for partition in &summary.created_partitions {
+                        println!("  - {}", partition);
+                    }
+                }
+                if !summary.dropped_partitions.is_empty() {
+                    println!("Dropped:");
+                    for partition in &summary.dropped_partitions {
+                        println!("  - {}", partition);
+                    }
+                }
                 if !summary.failed_tables.is_empty() {
                     println!("Failed tables:");
                     for table in summary.failed_tables {
@@ -276,21 +437,76 @@ async fn main() -> Result<()> {
         }
 
         Some(Commands::Export { output, format }) => {
-            // For Phase 1, export empty registrations (full implementation in Phase 2)
-            let registrations: Vec<pg_partitioner::types::PartitionRegistration> = Vec::new();
+            let regs = registrations::list_registrations(&client).await?;
 
             match format.as_str() {
                 "yaml" => {
-                    export::ConfigExporter::export_to_yaml(&registrations, &output)?;
+                    export::ConfigExporter::export_to_yaml(&regs, &output)?;
                 }
                 "json" => {
-                    export::ConfigExporter::export_to_json(&registrations, &output)?;
+                    export::ConfigExporter::export_to_json(&regs, &output)?;
                 }
                 _ => return Err(anyhow::anyhow!("Unknown format: {}", format)),
             }
 
             println!("Configuration exported to {}", output.display());
         }
+
+        Some(Commands::Install { format }) => {
+            let report = install::run_install(&client).await?;
+
+            let output = match format.as_str() {
+                "json" => serde_json::to_string_pretty(&report)?,
+                _ => install::format_install_report_text(&report),
+            };
+            println!("{}", output);
+
+            if report.components.iter().any(|c| c.error.is_some()) {
+                return Err(anyhow::anyhow!(
+                    "One or more components failed to install; see report above"
+                ));
+            }
+        }
+
+        Some(Commands::Register {
+            schema,
+            table,
+            strategy,
+            key,
+            interval,
+            premake,
+            retention_type,
+            retention_value,
+        }) => {
+            registrations::create_registrations_table(&client).await?;
+
+            let strategy = PartitionStrategy::from_registration_str(&strategy)?;
+            let retention_policy = build_retention_policy(retention_type, retention_value)?;
+
+            let registration = registrations::new_registration(
+                schema,
+                table,
+                strategy,
+                PartitionKey::new(key),
+                interval,
+                premake,
+                retention_policy,
+            );
+            registrations::upsert_registration(&client, &registration).await?;
+            println!(
+                "Registered {}.{}",
+                registration.schema_name, registration.table_name
+            );
+        }
+
+        Some(Commands::Unregister { schema, table }) => {
+            registrations::delete_registration(&client, &schema, &table).await?;
+            println!("Unregistered {}.{}", schema, table);
+        }
+
+        // Daemon is dispatched earlier (before the eager connection above is
+        // created) and always returns before reaching this match.
+        Some(Commands::Daemon { .. }) => unreachable!("Daemon is handled before this match"),
 
         None => {
             println!("pg-partitioner - PostgreSQL partitioning CLI");

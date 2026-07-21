@@ -8,7 +8,7 @@ pub const QUERY_PARTITIONED_TABLES: &str = r#"
         t.oid,
         n.nspname as schema_name,
         t.relname as table_name,
-        pt.partstrat as strategy,
+        pt.partstrat::text as strategy,
         string_agg(a.attname, ',' order by a.attnum) as partition_columns
     FROM pg_class t
     JOIN pg_namespace n ON n.oid = t.relnamespace
@@ -31,7 +31,7 @@ pub const QUERY_TABLE_SIZE: &str = r#"
 /// that can take minutes or never return in the time a status/risk report is
 /// willing to wait. n_live_tup is maintained incrementally by the stats
 /// collector as DML happens (not just after ANALYZE), so it stays a close,
-/// cheap estimate. Used for inspect/doctor/risk reporting, none of which need
+/// cheap estimate. Used for inspect/risk reporting, none of which need
 /// an exact count.
 pub const QUERY_TABLE_ROW_COUNT: &str = r#"
     SELECT COALESCE(n_live_tup, 0) as row_count

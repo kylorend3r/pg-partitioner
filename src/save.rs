@@ -35,9 +35,15 @@ impl LogStatus {
 
 pub async fn create_logbook_table(client: &Client) -> Result<()> {
     let query = r#"
-        CREATE TABLE IF NOT EXISTS partitioner_logbook (
+        CREATE SCHEMA IF NOT EXISTS partitioner;
+        CREATE TABLE IF NOT EXISTS partitioner.partitioner_logbook (
             id SERIAL PRIMARY KEY,
-            timestamp TIMESTAMP NOT NULL,
+            -- Stored as text (RFC3339), not TIMESTAMP: tokio-postgres is built
+            -- here without chrono support, so binding a Rust String against a
+            -- `::timestamp`-cast parameter (or reading a TIMESTAMP column back
+            -- into a String) fails — same class of mismatch already worked
+            -- around in registrations.rs's registered_at column.
+            timestamp VARCHAR(64) NOT NULL,
             action VARCHAR(64) NOT NULL,
             table_name VARCHAR(128) NOT NULL,
             status VARCHAR(16) NOT NULL,
@@ -45,9 +51,9 @@ pub async fn create_logbook_table(client: &Client) -> Result<()> {
             duration_ms INTEGER
         );
         CREATE INDEX IF NOT EXISTS idx_partitioner_logbook_timestamp
-            ON partitioner_logbook(timestamp DESC);
+            ON partitioner.partitioner_logbook(timestamp DESC);
         CREATE INDEX IF NOT EXISTS idx_partitioner_logbook_table
-            ON partitioner_logbook(table_name);
+            ON partitioner.partitioner_logbook(table_name);
     "#;
 
     client.batch_execute(query).await?;
@@ -56,8 +62,8 @@ pub async fn create_logbook_table(client: &Client) -> Result<()> {
 
 pub async fn append_log(client: &Client, entry: &LogEntry) -> Result<()> {
     let query = r#"
-        INSERT INTO partitioner_logbook (timestamp, action, table_name, status, details, duration_ms)
-        VALUES ($1::timestamp, $2, $3, $4, $5, $6)
+        INSERT INTO partitioner.partitioner_logbook (timestamp, action, table_name, status, details, duration_ms)
+        VALUES ($1, $2, $3, $4, $5, $6)
     "#;
 
     client
@@ -85,7 +91,7 @@ pub async fn get_recent_logs(
     let (query, rows) = if let Some(table) = table_name {
         let q = r#"
             SELECT id, timestamp, action, table_name, status, details, duration_ms
-            FROM partitioner_logbook
+            FROM partitioner.partitioner_logbook
             WHERE table_name = $1
             ORDER BY timestamp DESC
             LIMIT $2
@@ -99,7 +105,7 @@ pub async fn get_recent_logs(
     } else {
         let q = r#"
             SELECT id, timestamp, action, table_name, status, details, duration_ms
-            FROM partitioner_logbook
+            FROM partitioner.partitioner_logbook
             ORDER BY timestamp DESC
             LIMIT $1
         "#;

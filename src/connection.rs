@@ -71,13 +71,7 @@ pub async fn create_connection(config: &ConnectionConfig) -> Result<tokio_postgr
 }
 
 pub async fn verify_postgres_version(client: &Client) -> Result<()> {
-    let version_query = "SELECT current_setting('server_version_num')::int;";
-    let row = client
-        .query_one(version_query, &[])
-        .await
-        .map_err(|e| anyhow!("Failed to query server version: {}", e))?;
-
-    let version: i32 = row.get(0);
+    let version = get_postgres_version_num(client).await?;
     if version < 140000 {
         return Err(anyhow!(
             "PostgreSQL 14+ required. Current version: {}",
@@ -88,7 +82,17 @@ pub async fn verify_postgres_version(client: &Client) -> Result<()> {
     Ok(())
 }
 
-fn version_to_string(version: i32) -> String {
+pub async fn get_postgres_version_num(client: &Client) -> Result<i32> {
+    let version_query = "SELECT current_setting('server_version_num')::int;";
+    let row = client
+        .query_one(version_query, &[])
+        .await
+        .map_err(|e| anyhow!("Failed to query server version: {}", e))?;
+
+    Ok(row.get(0))
+}
+
+pub fn version_to_string(version: i32) -> String {
     let major = version / 10000;
     let minor = (version % 10000) / 100;
     let patch = version % 100;

@@ -72,6 +72,157 @@ fn generate_check_constraint(column: &str, min_val: &str, max_val: &str) -> Stri
     format!("({} >= '{}' AND {} < '{}')", column, min_val, column, max_val)
 }
 
+/// Upper-bound-only CHECK constraint, used for the ATTACH-first cutover path
+/// where the legacy chunk's lower bound is `MINVALUE` (unbounded) — a CHECK
+/// constraint doesn't need to restate that, only the upper bound the ATTACH
+/// itself needs proven.
+pub fn generate_upper_bound_constraint(column: &str, upper_val: &str) -> String {
+    format!("({} < {})", column, queries::quote_literal(upper_val))
+}
+
+/// Computes every period-boundary timestamp from `start_date` through
+/// `premake_count` periods past today: `[0]` is `date_trunc(unit, start_date)`
+/// — the cutover boundary, above which the one `MINVALUE`-bounded legacy
+/// partition catches everything *older* than `start_date` — and `[1..]` are
+/// each subsequent real per-period boundary (historical and forward alike;
+/// there's no structural distinction between them, both are ordinary
+/// `CREATE TABLE ... PARTITION OF ... FOR VALUES FROM/TO` ranges).
+///
+/// The anchor unit (day/week/month/year) is chosen by a simple substring
+/// match on `interval` rather than a full interval parser — this project's
+/// own docs and tests only ever illustrate day/week/month/year time-series
+/// partitioning. Note this assumes a single-unit interval (`"1 day"`,
+/// `"1 month"`, ...): a multi-unit interval like `"2 months"` isn't
+/// guaranteed to land the stepped sequence exactly on
+/// `date_trunc(unit, now())` — a pre-existing imprecision in the anchor-unit
+/// heuristic itself, not new to this function.
+pub async fn compute_partition_boundaries(
+    client: &Client,
+    interval: &str,
+    premake_count: usize,
+    start_date: &str,
+) -> Result<Vec<String>> {
+    let anchor_unit = anchor_unit_for_interval(interval);
+
+    let stop_periods = i32::try_from(premake_count + 1)
+        .map_err(|_| anyhow::anyhow!("premake_count too large: {}", premake_count))?;
+
+    // Neither `interval` nor `start_date` can be bound parameters here: an
+    // explicit `$N::interval`/`$N::timestamptz` cast makes Postgres's
+    // DESCRIBE step report that parameter's type as the cast target, and
+    // tokio-postgres's `&str`/`String` ToSql only accepts text-family OIDs
+    // (the same class of mismatch as binding a String against a
+    // `::jsonb`-cast parameter). Embed both as quoted literals instead — the
+    // same approach every other DDL-building function in this module already
+    // uses for user-influenced string values. `$1` (anchor_unit) has no cast
+    // and stays a bound parameter, as before.
+    let query = format!(
+        r#"
+        SELECT (boundary)::text AS boundary
+        FROM generate_series(
+            date_trunc($1, {start}::timestamptz),
+            date_trunc($1, now()) + {stop_periods} * {interval}::interval,
+            {interval}::interval
+        ) AS boundary
+        ORDER BY boundary
+        "#,
+        start = queries::quote_literal(start_date),
+        interval = queries::quote_literal(interval),
+        stop_periods = stop_periods,
+    );
+
+    let rows = client.query(&query, &[&anchor_unit]).await?;
+
+    Ok(rows.iter().map(|row| row.get::<_, String>(0)).collect())
+}
+
+/// Anchor unit (day/week/month/year) chosen by a simple substring match on
+/// `interval` rather than a full interval parser — shared by
+/// `compute_partition_boundaries` and `compute_forward_boundaries`.
+pub(crate) fn anchor_unit_for_interval(interval: &str) -> &'static str {
+    if interval.contains("year") {
+        "year"
+    } else if interval.contains("month") {
+        "month"
+    } else if interval.contains("week") {
+        "week"
+    } else {
+        "day"
+    }
+}
+
+/// Computes `premake_count + 1` period-boundary timestamps anchored on
+/// *today*, for ongoing maintenance premake (as opposed to
+/// `compute_partition_boundaries`'s one-time historical-to-forward split at
+/// initial migration time): `[today's period start, +1 interval, ...,
+/// +premake_count intervals]`. Recomputed fresh on every maintenance sweep,
+/// so the window naturally slides forward as time passes.
+pub async fn compute_forward_boundaries(
+    client: &Client,
+    interval: &str,
+    premake_count: usize,
+) -> Result<Vec<String>> {
+    let anchor_unit = anchor_unit_for_interval(interval);
+
+    let premake_i32 = i32::try_from(premake_count)
+        .map_err(|_| anyhow::anyhow!("premake_count too large: {}", premake_count))?;
+
+    // Same rule as compute_partition_boundaries: `interval` can't be a bound
+    // parameter here (an explicit `::interval` cast would make tokio-postgres
+    // require a non-text OID for it), so it's embedded as a quoted literal.
+    let query = format!(
+        r#"
+        SELECT (date_trunc($1, now()) + n.i * {interval}::interval)::text AS boundary
+        FROM generate_series(0, {premake}) AS n(i)
+        ORDER BY n.i
+        "#,
+        interval = queries::quote_literal(interval),
+        premake = premake_i32,
+    );
+
+    let rows = client.query(&query, &[&anchor_unit]).await?;
+
+    Ok(rows.iter().map(|row| row.get::<_, String>(0)).collect())
+}
+
+/// Builds a `{table}_{lower_ymd}_{upper_ymd}` partition name (e.g.
+/// `products_2026_07_22_2026_07_23`) from two boundary strings. Boundaries
+/// returned by `compute_partition_boundaries` are always midnight-truncated
+/// timestamps in `"YYYY-MM-DD ..."` form, so the leading 10 bytes are always
+/// the date — no full date parsing needed, just a slice and a character swap.
+pub fn date_range_partition_name(table: &str, lower: &str, upper: &str) -> String {
+    let lower_ymd = lower.get(..10).unwrap_or(lower).replace('-', "_");
+    let upper_ymd = upper.get(..10).unwrap_or(upper).replace('-', "_");
+    format!("{}_{}_{}", table, lower_ymd, upper_ymd)
+}
+
+/// Creates one range partition with an explicit `[lower, upper)` bound —
+/// used for the forward-looking partitions created after cutover.
+/// `IF NOT EXISTS` makes a retried `apply` (after a partial mid-loop
+/// failure) safe to re-run without erroring on partitions that already
+/// succeeded.
+pub async fn create_range_partition(
+    client: &Client,
+    schema: &str,
+    table: &str,
+    partition_name: &str,
+    lower: &str,
+    upper: &str,
+    retry_policy: &RetryPolicy,
+) -> Result<()> {
+    let query = format!(
+        "CREATE TABLE IF NOT EXISTS {}.{} PARTITION OF {}.{} FOR VALUES FROM ({}) TO ({})",
+        queries::quote_ident(schema),
+        queries::quote_ident(partition_name),
+        queries::quote_ident(schema),
+        queries::quote_ident(table),
+        queries::quote_literal(lower),
+        queries::quote_literal(upper),
+    );
+
+    retry::execute_batch_with_retry(client, "create_range_partition", &query, retry_policy).await
+}
+
 async fn check_update_activity(client: &Client, schema: &str, table: &str) -> Result<bool> {
     let query = r#"
         SELECT n_tup_upd > 0
@@ -104,10 +255,21 @@ pub async fn create_partitioned_shadow_table(
         crate::types::PartitionStrategy::Hash => "HASH",
     };
 
+    // `LIKE ... INCLUDING DEFAULTS` (not `INCLUDING ALL`/`INCLUDING
+    // CONSTRAINTS`/`INCLUDING INDEXES`): a partitioned table's own column
+    // list can't be omitted (a bare `PARTITION BY` with no column list is a
+    // syntax error), but pulling in the source's unique/PK constraints or
+    // indexes here would fail outright if they don't include the partition
+    // key (exactly the case the CreateIndex step already works around by
+    // skipping them) — so only column definitions/types/defaults are copied;
+    // NOT NULL is copied regardless, as it's inherent to the column
+    // definition rather than gated by an INCLUDING option.
     let create_query = format!(
-        "CREATE TABLE {}.{} PARTITION BY {} ({})",
+        "CREATE TABLE {}.{} (LIKE {}.{} INCLUDING DEFAULTS) PARTITION BY {} ({})",
         queries::quote_ident(schema),
         queries::quote_ident(&shadow_name),
+        queries::quote_ident(schema),
+        queries::quote_ident(table),
         strategy_str,
         partition_columns
     );
@@ -126,13 +288,16 @@ pub async fn add_check_constraint(
     retry_policy: &RetryPolicy,
 ) -> Result<()> {
     let constraint_name = format!("{}_partition_check", table);
+    let schema_q = queries::quote_ident(schema);
+    let table_q = queries::quote_ident(table);
+    let constraint_q = queries::quote_ident(&constraint_name);
 
+    // DROP...IF EXISTS first so a retried `apply` (after a later step in the
+    // same sequence failed) can safely re-add this constraint rather than
+    // erroring on "constraint already exists".
     let query = format!(
-        "ALTER TABLE {}.{} ADD CONSTRAINT {} CHECK {} NOT VALID",
-        queries::quote_ident(schema),
-        queries::quote_ident(table),
-        queries::quote_ident(&constraint_name),
-        constraint_expr
+        "ALTER TABLE {schema_q}.{table_q} DROP CONSTRAINT IF EXISTS {constraint_q}; \
+         ALTER TABLE {schema_q}.{table_q} ADD CONSTRAINT {constraint_q} CHECK {constraint_expr} NOT VALID"
     );
 
     retry::execute_batch_with_retry(client, "add_check_constraint", &query, retry_policy).await
@@ -224,6 +389,42 @@ pub async fn perform_atomic_cutover(
     retry::execute_batch_with_retry(client, "atomic_cutover", &sql, retry_policy).await
 }
 
+/// Detaches `partition_name` from `parent_table`, taking `ACCESS EXCLUSIVE`
+/// on the parent explicitly before the `DETACH PARTITION` itself, and
+/// releasing it via the transaction's own `COMMIT` — same fail-fast-and-
+/// document-the-requirement reasoning as `perform_atomic_cutover`'s explicit
+/// `LOCK TABLE`: either the lock is acquired immediately (or within
+/// `lock_timeout`, with retry/backoff on contention) or nothing happens,
+/// rather than the plain `DETACH PARTITION` statement silently queuing
+/// behind unrelated traffic while holding no visible intent.
+pub async fn detach_partition(
+    client: &Client,
+    schema: &str,
+    parent_table: &str,
+    partition_name: &str,
+    retry_policy: &RetryPolicy,
+) -> Result<()> {
+    let schema_quoted = queries::quote_ident(schema);
+    let parent_quoted = queries::quote_ident(parent_table);
+    let partition_quoted = queries::quote_ident(partition_name);
+
+    let sql = format!(
+        "BEGIN; \
+        SET LOCAL lock_timeout = '{lock_timeout_ms}ms'; \
+        SET LOCAL statement_timeout = '{statement_timeout_ms}ms'; \
+        LOCK TABLE {schema}.{parent} IN ACCESS EXCLUSIVE MODE; \
+        ALTER TABLE {schema}.{parent} DETACH PARTITION {schema}.{partition}; \
+        COMMIT;",
+        lock_timeout_ms = retry_policy.lock_timeout_ms,
+        statement_timeout_ms = retry_policy.statement_timeout_ms,
+        schema = schema_quoted,
+        parent = parent_quoted,
+        partition = partition_quoted,
+    );
+
+    retry::execute_batch_with_retry(client, "detach_partition", &sql, retry_policy).await
+}
+
 pub async fn create_default_partition(
     client: &Client,
     schema: &str,
@@ -233,7 +434,7 @@ pub async fn create_default_partition(
     let default_name = format!("{}_default", table);
 
     let query = format!(
-        "CREATE TABLE {}.{} PARTITION OF {}.{} DEFAULT",
+        "CREATE TABLE IF NOT EXISTS {}.{} PARTITION OF {}.{} DEFAULT",
         queries::quote_ident(schema),
         queries::quote_ident(&default_name),
         queries::quote_ident(schema),
@@ -290,10 +491,59 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_anchor_unit_for_interval() {
+        assert_eq!(anchor_unit_for_interval("1 year"), "year");
+        assert_eq!(anchor_unit_for_interval("1 month"), "month");
+        assert_eq!(anchor_unit_for_interval("1 week"), "week");
+        assert_eq!(anchor_unit_for_interval("1 day"), "day");
+        assert_eq!(anchor_unit_for_interval("7 days"), "day");
+    }
+
+    #[test]
     fn test_generate_check_constraint() {
         let constraint = generate_check_constraint("created_at", "2026-01-01", "2026-02-01");
         assert!(constraint.contains("created_at"));
         assert!(constraint.contains("2026-01-01"));
         assert!(constraint.contains("2026-02-01"));
+    }
+
+    #[test]
+    fn test_generate_upper_bound_constraint() {
+        let constraint = generate_upper_bound_constraint("created_at", "2026-08-01 00:00:00");
+        assert_eq!(constraint, "(created_at < '2026-08-01 00:00:00')");
+    }
+
+    #[test]
+    fn test_date_range_partition_name() {
+        assert_eq!(
+            date_range_partition_name("products", "2026-07-22 00:00:00+00", "2026-07-23 00:00:00+00"),
+            "products_2026_07_22_2026_07_23"
+        );
+        // Also handles bare date strings (no time-of-day component) safely.
+        assert_eq!(
+            date_range_partition_name("products", "2026-07-22", "2026-07-23"),
+            "products_2026_07_22_2026_07_23"
+        );
+    }
+
+    #[test]
+    fn test_boundaries_windows_pairing() {
+        // Mirrors how orchestrator.rs turns `compute_partition_boundaries`'
+        // output into forward-partition (lower, upper) pairs via `.windows(2)`.
+        let boundaries = vec![
+            "2026-08-01".to_string(),
+            "2026-09-01".to_string(),
+            "2026-10-01".to_string(),
+            "2026-11-01".to_string(),
+        ];
+
+        let pairs: Vec<(&String, &String)> = boundaries
+            .windows(2)
+            .map(|w| (&w[0], &w[1]))
+            .collect();
+
+        assert_eq!(pairs.len(), 3);
+        assert_eq!(pairs[0], (&"2026-08-01".to_string(), &"2026-09-01".to_string()));
+        assert_eq!(pairs[2], (&"2026-10-01".to_string(), &"2026-11-01".to_string()));
     }
 }

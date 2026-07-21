@@ -1,3 +1,4 @@
+use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -5,6 +6,28 @@ pub enum PartitionStrategy {
     Range,
     List,
     Hash,
+}
+
+impl PartitionStrategy {
+    /// String form used in `partitioner_registrations.strategy` — distinct from
+    /// PostgreSQL's own single-letter `pg_partitioned_table.partstrat` codes
+    /// (`r`/`l`/`h`) used when parsing the live catalog in `schema.rs`.
+    pub fn as_registration_str(&self) -> &'static str {
+        match self {
+            PartitionStrategy::Range => "range",
+            PartitionStrategy::List => "list",
+            PartitionStrategy::Hash => "hash",
+        }
+    }
+
+    pub fn from_registration_str(s: &str) -> Result<Self> {
+        match s {
+            "range" => Ok(PartitionStrategy::Range),
+            "list" => Ok(PartitionStrategy::List),
+            "hash" => Ok(PartitionStrategy::Hash),
+            other => Err(anyhow!("Unknown partition strategy: {}", other)),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -108,22 +131,6 @@ pub enum ActionType {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DoctorFinding {
-    pub severity: FindingSeverity,
-    pub category: String,
-    pub table_name: String,
-    pub message: String,
-    pub remediation: String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum FindingSeverity {
-    Info,
-    Warning,
-    Critical,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConnectionConfig {
     pub host: String,
     pub port: u16,
@@ -161,6 +168,39 @@ pub struct Plan {
     pub database: String,
     pub schema_checksum: String,
     pub actions: Vec<PlanAction>,
+    /// The migration config this plan was computed from. Optional (and
+    /// `#[serde(default)]`) so plan files written before this field existed
+    /// still deserialize as `None` instead of failing.
+    #[serde(default)]
+    pub migration_config: Option<MigrationConfig>,
+    #[serde(default)]
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReconciliationStatus {
+    /// Registered and the live catalog matches the registration.
+    Healthy,
+    /// Registered but no matching partitioned table found in the live catalog.
+    DriftMissing,
+    /// Registered and live, but strategy or partition key columns differ.
+    DriftMismatch,
+    /// Found partitioned in the live catalog but not registered.
+    Unmanaged,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReconciliationEntry {
+    pub schema_name: String,
+    pub table_name: String,
+    pub status: ReconciliationStatus,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReconciliationSummary {
+    pub entries: Vec<ReconciliationEntry>,
+    pub note: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -169,6 +209,8 @@ pub struct InspectReport {
     pub database: String,
     pub tables: Vec<PartitionSetInfo>,
     pub risks: Vec<RiskSignal>,
+    pub registrations: Vec<PartitionRegistration>,
+    pub reconciliation: ReconciliationSummary,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -206,6 +248,15 @@ pub struct MigrationConfig {
     pub interval: String,
     pub premake_count: usize,
     pub use_bulk_copy: bool,
+    #[serde(default)]
+    pub retention_policy: Option<RetentionPolicy>,
+    /// Minimum date (`YYYY-MM-DD`) to start real per-period partitions from;
+    /// data older than this lands in the one `MINVALUE`-bounded legacy
+    /// partition instead. `#[serde(default)]` for the same backward-compat
+    /// reason as `retention_policy` — protects deserializing plan JSON
+    /// written before this field existed, even though the CLI requires it.
+    #[serde(default)]
+    pub start_date: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

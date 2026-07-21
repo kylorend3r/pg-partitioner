@@ -9,6 +9,7 @@ use crate::types::{ConnectionConfig, SslMode};
 pub struct ConfigFile {
     pub database: Option<DatabaseConfig>,
     pub logging: Option<LoggingConfig>,
+    pub daemon: Option<DaemonSettings>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -26,6 +27,12 @@ pub struct LoggingConfig {
     pub level: Option<String>,
     pub format: Option<String>,
     pub file: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DaemonSettings {
+    pub interval_secs: Option<u64>,
+    pub graceful_shutdown_timeout_secs: Option<u64>,
 }
 
 impl ConfigFile {
@@ -67,6 +74,7 @@ impl Default for ConfigFile {
         ConfigFile {
             database: None,
             logging: None,
+            daemon: None,
         }
     }
 }
@@ -161,6 +169,47 @@ impl ConfigResolver {
             password,
             ssl_mode,
         })
+    }
+
+    pub fn resolve_daemon_config(
+        &self,
+        cli_interval_secs: Option<u64>,
+        cli_graceful_shutdown_timeout_secs: Option<u64>,
+    ) -> crate::daemon::DaemonConfig {
+        let default = crate::daemon::DaemonConfig::default();
+
+        let interval_secs = cli_interval_secs
+            .or_else(|| {
+                self.file_config
+                    .daemon
+                    .as_ref()
+                    .and_then(|d| d.interval_secs)
+            })
+            .or_else(|| {
+                std::env::var("PG_PARTITIONER_DAEMON_INTERVAL_SECS")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+            })
+            .unwrap_or(default.maintenance_interval_secs);
+
+        let graceful_shutdown_timeout_secs = cli_graceful_shutdown_timeout_secs
+            .or_else(|| {
+                self.file_config
+                    .daemon
+                    .as_ref()
+                    .and_then(|d| d.graceful_shutdown_timeout_secs)
+            })
+            .or_else(|| {
+                std::env::var("PG_PARTITIONER_DAEMON_GRACEFUL_SHUTDOWN_SECS")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+            })
+            .unwrap_or(default.graceful_shutdown_timeout_secs);
+
+        crate::daemon::DaemonConfig {
+            maintenance_interval_secs: interval_secs,
+            graceful_shutdown_timeout_secs,
+        }
     }
 }
 

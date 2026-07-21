@@ -45,7 +45,10 @@ impl Applier {
         info!("Schema checksum matches - proceeding with plan execution");
 
         // Execute all actions in order through the orchestrator
-        let results = self.orchestrator.execute_plan(client, plan_obj.actions.clone()).await?;
+        let results = self
+            .orchestrator
+            .execute_plan(client, plan_obj.actions.clone(), plan_obj.migration_config.as_ref())
+            .await?;
 
         // Log summary
         let success_count = results.iter().filter(|r| matches!(r.status, crate::orchestrator::ExecutionStatus::Success)).count();
@@ -56,6 +59,24 @@ impl Applier {
             total_duration_ms = total_duration_ms,
             "Plan execution completed"
         );
+
+        if let Some(config) = &plan_obj.migration_config {
+            crate::registrations::create_registrations_table(client).await?;
+            let registration = crate::registrations::new_registration(
+                schema.to_string(),
+                table.to_string(),
+                config.partition_strategy,
+                config.partition_key.clone(),
+                config.interval.clone(),
+                config.premake_count,
+                config.retention_policy.clone(),
+            );
+            crate::registrations::upsert_registration(client, &registration).await?;
+            info!(
+                table = format!("{}.{}", schema, table),
+                "Auto-registered table in partitioner_registrations"
+            );
+        }
 
         Ok(())
     }

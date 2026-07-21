@@ -30,7 +30,8 @@ pub enum CheckpointProgress {
 
 pub async fn create_checkpoint_table(client: &Client) -> Result<()> {
     let query = r#"
-        CREATE TABLE IF NOT EXISTS partitioner_state (
+        CREATE SCHEMA IF NOT EXISTS partitioner;
+        CREATE TABLE IF NOT EXISTS partitioner.partitioner_state (
             id VARCHAR(36) PRIMARY KEY,
             operation VARCHAR(64) NOT NULL,
             table_name VARCHAR(128) NOT NULL,
@@ -39,7 +40,7 @@ pub async fn create_checkpoint_table(client: &Client) -> Result<()> {
             last_updated TIMESTAMP NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_partitioner_state_table
-            ON partitioner_state(table_name);
+            ON partitioner.partitioner_state(table_name);
     "#;
 
     client.batch_execute(query).await?;
@@ -50,7 +51,7 @@ pub async fn save_checkpoint(client: &Client, checkpoint: &Checkpoint) -> Result
     let progress_json = serde_json::to_string(&checkpoint.progress)?;
 
     let query = r#"
-        INSERT INTO partitioner_state (id, operation, table_name, progress, created_at, last_updated)
+        INSERT INTO partitioner.partitioner_state (id, operation, table_name, progress, created_at, last_updated)
         VALUES ($1, $2, $3, $4::jsonb, $5::timestamp, $6::timestamp)
         ON CONFLICT (id) DO UPDATE SET
             progress = EXCLUDED.progress,
@@ -77,7 +78,7 @@ pub async fn save_checkpoint(client: &Client, checkpoint: &Checkpoint) -> Result
 pub async fn get_checkpoint(client: &Client, id: &str) -> Result<Option<Checkpoint>> {
     let query = r#"
         SELECT id, operation, table_name, progress, created_at, last_updated
-        FROM partitioner_state
+        FROM partitioner.partitioner_state
         WHERE id = $1
     "#;
 
@@ -103,7 +104,7 @@ pub async fn get_checkpoint(client: &Client, id: &str) -> Result<Option<Checkpoi
 pub async fn list_active_checkpoints(client: &Client, table_name: &str) -> Result<Vec<Checkpoint>> {
     let query = r#"
         SELECT id, operation, table_name, progress, created_at, last_updated
-        FROM partitioner_state
+        FROM partitioner.partitioner_state
         WHERE table_name = $1 AND progress ->> 'Started' IS NOT NULL
         ORDER BY created_at DESC
     "#;
@@ -130,7 +131,7 @@ pub async fn list_active_checkpoints(client: &Client, table_name: &str) -> Resul
 
 pub async fn delete_checkpoint(client: &Client, id: &str) -> Result<()> {
     client
-        .execute("DELETE FROM partitioner_state WHERE id = $1", &[&id])
+        .execute("DELETE FROM partitioner.partitioner_state WHERE id = $1", &[&id])
         .await?;
     Ok(())
 }

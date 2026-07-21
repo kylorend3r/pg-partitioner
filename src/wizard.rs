@@ -19,6 +19,8 @@ impl SetupWizard {
             interval: "1 month".to_string(),
             premake_count: 3,
             use_bulk_copy: false,
+            retention_policy: None,
+            start_date: None,
         };
 
         Ok(config)
@@ -38,6 +40,8 @@ mod tests {
             interval: "1 month".to_string(),
             premake_count: 3,
             use_bulk_copy: false,
+            retention_policy: None,
+            start_date: None,
         };
 
         assert_eq!(config.interval, "1 month");

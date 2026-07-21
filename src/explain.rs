@@ -182,7 +182,7 @@ pub fn explain_partition_setup(report: &InspectReport) -> String {
     }
 
     explanation.push_str("For more detailed analysis, run:\n");
-    explanation.push_str("  pg-partitioner doctor --table <table_name>\n");
+    explanation.push_str("  pg-partitioner inspect --table <table_name>\n");
 
     explanation
 }
@@ -207,6 +207,11 @@ mod tests {
             database: "testdb".to_string(),
             tables: vec![],
             risks: vec![],
+            registrations: vec![],
+            reconciliation: crate::types::ReconciliationSummary {
+                entries: vec![],
+                note: None,
+            },
         };
 
         let explanation = explain_partition_setup(&report);
@@ -234,6 +239,11 @@ mod tests {
                 premake_count: 0,
             }],
             risks: vec![],
+            registrations: vec![],
+            reconciliation: crate::types::ReconciliationSummary {
+                entries: vec![],
+                note: None,
+            },
         };
 
         let explanation = explain_partition_setup(&report);

@@ -5,7 +5,7 @@ use crate::schema;
 use crate::types::{PartitionSetInfo, RiskSignal};
 
 const LARGE_TABLE_THRESHOLD: i64 = 100 * 1024 * 1024; // 100 MB
-const PLANNER_RISK_PARTITION_COUNT: usize = 1000;
+pub(crate) const PLANNER_RISK_PARTITION_COUNT: usize = 1000;
 const MAX_LOCKS_BUFFER: usize = 100;
 
 pub async fn detect_risks(

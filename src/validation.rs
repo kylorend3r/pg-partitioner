@@ -86,6 +86,25 @@ fn validate_identifier_lengths(
 ) -> Vec<ValidationError> {
     let mut errors = Vec::new();
     const IDENTIFIER_LIMIT: usize = 63;
+    // Postgres's real limit is 63 bytes, but every derived partition/index
+    // name adds a suffix on top of the table name — capping the table name
+    // itself well below the hard limit leaves headroom for those suffixes
+    // instead of relying solely on per-suffix math.
+    const MAX_TABLE_NAME_LEN: usize = 60;
+
+    if table.len() > MAX_TABLE_NAME_LEN {
+        errors.push(ValidationError {
+            category: "table_name_too_long".to_string(),
+            message: format!(
+                "Table name '{}' is {} characters; this tool caps table names at {} to leave \
+                 headroom below PostgreSQL's 63-byte identifier limit for derived partition/index names",
+                table,
+                table.len(),
+                MAX_TABLE_NAME_LEN
+            ),
+            suggestion: Some(format!("Use a table name of {} characters or fewer", MAX_TABLE_NAME_LEN)),
+        });
+    }
 
     let base_name = format!("{}_{}", table, interval);
 
@@ -116,6 +135,24 @@ fn validate_identifier_lengths(
                 suggestion: Some("Use shorter names".to_string()),
             });
         }
+    }
+
+    // Date-range partition names (`{table}_YYYY_MM_DD_YYYY_MM_DD`) always add
+    // exactly 22 bytes (6 underscores + 16 digits) regardless of the actual
+    // dates involved, so this is a pure function of table.len() — no need to
+    // compute real boundaries here.
+    const DATE_RANGE_SUFFIX_LEN: usize = 22;
+    let worst_case_len = table.len() + DATE_RANGE_SUFFIX_LEN;
+    if worst_case_len > IDENTIFIER_LIMIT {
+        errors.push(ValidationError {
+            category: "partition_name_too_long".to_string(),
+            message: format!(
+                "Date-range partition names for '{}' would exceed PostgreSQL's 63-byte limit \
+                 (worst case: {} bytes, e.g. '{}_YYYY_MM_DD_YYYY_MM_DD')",
+                table, worst_case_len, table
+            ),
+            suggestion: Some("Use a shorter table name".to_string()),
+        });
     }
 
     errors
@@ -226,5 +263,26 @@ mod tests {
         let long_table = "a".repeat(60);
         let errors = validate_identifier_lengths("public", &long_table, &PartitionKey::single("created_at".to_string()), "2026_07");
         assert!(!errors.is_empty()); // Long name should fail
+    }
+
+    #[test]
+    fn test_validate_table_name_max_60_chars() {
+        let at_limit = "a".repeat(60);
+        let errors = validate_identifier_lengths("public", &at_limit, &PartitionKey::single("created_at".to_string()), "d");
+        assert!(!errors.iter().any(|e| e.category == "table_name_too_long")); // exactly 60 is allowed
+
+        let over_limit = "a".repeat(61);
+        let errors = validate_identifier_lengths("public", &over_limit, &PartitionKey::single("created_at".to_string()), "d");
+        assert!(errors.iter().any(|e| e.category == "table_name_too_long"));
+    }
+
+    #[test]
+    fn test_validate_identifier_lengths_date_range_partition_name() {
+        // Short enough to pass the existing interval-suffix check (45 + 1 + 7 = 53 <= 63)
+        // but long enough to overflow the date-range partition name check (45 + 22 = 67 > 63).
+        let table = "a".repeat(45);
+        let errors = validate_identifier_lengths("public", &table, &PartitionKey::single("created_at".to_string()), "2026_07");
+        assert!(errors.iter().any(|e| e.category == "partition_name_too_long"));
+        assert!(!errors.iter().any(|e| e.category == "identifier_too_long"));
     }
 }

@@ -2,6 +2,8 @@ use anyhow::Result;
 use tokio_postgres::Client;
 
 use crate::queries;
+use crate::retry;
+use crate::types::RetryPolicy;
 
 #[derive(Debug, Clone)]
 pub struct IndexDef {
@@ -61,6 +63,7 @@ pub async fn create_index_on_parent(
     columns: &[String],
     is_unique: bool,
     concurrently: bool,
+    retry_policy: &RetryPolicy,
 ) -> Result<()> {
     let columns_str = columns.join(", ");
     let unique_keyword = if is_unique { "UNIQUE" } else { "" };
@@ -76,9 +79,7 @@ pub async fn create_index_on_parent(
         columns_str
     );
 
-    client.execute(&query, &[]).await?;
-
-    Ok(())
+    retry::execute_batch_with_retry(client, "create_index_on_parent", &query, retry_policy).await
 }
 
 pub async fn drop_index(

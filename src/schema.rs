@@ -9,7 +9,7 @@ pub async fn get_partitioned_tables(client: &Client) -> Result<Vec<PartitionSetI
 
     let mut tables = Vec::new();
     for row in rows {
-        let oid: u32 = row.get::<_, i32>(0) as u32;
+        let oid: u32 = row.get(0);
         let schema_name: String = row.get(1);
         let table_name: String = row.get(2);
         let strategy_str: &str = row.get(3);
@@ -169,7 +169,7 @@ pub async fn get_unpartitioned_large_tables(client: &Client) -> Result<Vec<Parti
 
     let mut tables = Vec::new();
     for row in rows {
-        let _oid: u32 = row.get::<_, i32>(0) as u32;
+        let _oid: u32 = row.get(0);
         let schema_name: String = row.get(1);
         let table_name: String = row.get(2);
         let row_count: i64 = row.get(3);
