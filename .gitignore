@@ -1,0 +1,17 @@
+/target
+
+# Editor / OS cruft
+.DS_Store
+*.swp
+.idea/
+.vscode/
+
+# Local env / secrets
+.env
+.env.*
+
+# Test fixtures
+tests/fixtures/
+
+# Claude Code local settings
+.claude/settings.local.json
