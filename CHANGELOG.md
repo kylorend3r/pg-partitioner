@@ -44,8 +44,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   rather than a limitation of this tool (`PARTITION BY LIST` accepts one column; RANGE and HASH
   accept composite keys). Reported as `list_key_must_be_single_column`.
 
-- `CLAUDE.md`, a development guide covering the Rust and PostgreSQL rules this codebase has
-  learned the hard way, and this changelog.
+- This changelog.
 
 ### Changed
 

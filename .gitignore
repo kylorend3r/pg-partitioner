@@ -13,8 +13,10 @@
 # Test fixtures
 tests/fixtures/
 
-# Claude Code local settings
+# Claude Code local settings + development guide
 .claude/settings.local.json
+CLAUDE.md
+CLAUDE.local.md
 
 # Docs
 docs/

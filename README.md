@@ -37,7 +37,7 @@ The honest counterpoint: pg_partman has roughly a decade of production hardening
 
 ## Core design decisions
 
-These aren't defaults you should casually override. `CLAUDE.md` carries the rules that follow from them; `docs/IMPLEMENTATION_GUIDE.md` has the longer reasoning (local design record, not part of the repo).
+These aren't defaults you should casually override — `docs/IMPLEMENTATION_GUIDE.md` has the full reasoning (a local design record, not part of the repo).
 
 - **PostgreSQL 14+ only.** No trigger-based partitioning, no shims for older versions.
 - **Cutover-first migration, not bulk-copy-first.** Converting a populated table attaches it as a partition within one short transaction (pre-validated `CHECK` constraint + `ATTACH`) rather than copying data over an extended window while the old table stays live — the latter has a real correctness gap for tables with update activity on existing rows. Batched bulk-copy exists only as a fallback for the rare case direct attach isn't possible.
@@ -258,12 +258,13 @@ src/            application source (see docs/project-structure.md for the module
 tests/          integration tests + tests/fixtures/, a numbered zero-to-hero fixture catalog
 docs/           design record — read docs/IMPLEMENTATION_GUIDE.md first
 scripts/        setup_test_env.sh / reset_test_env.sh for the disposable test container
-CLAUDE.md       development guide — Rust/PostgreSQL rules and the workflow for changing this repo
 CHANGELOG.md    what changed, per release
 ```
 
-`docs/` and `tests/fixtures/` are gitignored: they're a local design record and fixture catalog,
-not shipped content. Start from `CLAUDE.md` if you're making a change here.
+`docs/` and `tests/fixtures/` are gitignored — a local design record and fixture catalog, not
+shipped content. The operational knowledge that matters for changing this code lives in comments
+at the call sites it applies to (see `src/queries.rs` on relation-name quoting, and
+`src/migration.rs` on parameter binding).
 
 ## Testing against a real database
 
