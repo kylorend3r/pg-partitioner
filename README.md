@@ -37,14 +37,14 @@ The honest counterpoint: pg_partman has roughly a decade of production hardening
 
 ## Core design decisions
 
-These aren't defaults you should casually override — see `docs/IMPLEMENTATION_GUIDE.md` for the full reasoning.
+These aren't defaults you should casually override. `CLAUDE.md` carries the rules that follow from them; `docs/IMPLEMENTATION_GUIDE.md` has the longer reasoning (local design record, not part of the repo).
 
 - **PostgreSQL 14+ only.** No trigger-based partitioning, no shims for older versions.
 - **Cutover-first migration, not bulk-copy-first.** Converting a populated table attaches it as a partition within one short transaction (pre-validated `CHECK` constraint + `ATTACH`) rather than copying data over an extended window while the old table stays live — the latter has a real correctness gap for tables with update activity on existing rows. Batched bulk-copy exists only as a fallback for the rare case direct attach isn't possible.
 - **Every DDL action runs through a single lock/timeout/retry path.** `SET LOCAL lock_timeout`/`statement_timeout`, backoff-retry on `55P03`/`40P01`, every attempt logged — no action takes a bare, unguarded lock.
 - **Plan/apply drift detection is mandatory.** `apply` refuses to run if the live schema's checksum doesn't match what `plan` computed against.
 - **Approximate row counts, not `COUNT(*)`.** Status/risk reporting reads `pg_stat_user_tables.n_live_tup` instead of scanning the table — the table most likely to need a fast answer (a huge one, or one whose default partition has quietly filled up) is exactly the one where `COUNT(*)` is slowest.
-- **Default partitions are actively reconciled, not just monitored.** Stray rows get moved to where they belong, not just flagged.
+- **Default partitions are treated as a problem to fix, not just a metric.** Rows that accumulate in a default partition are surfaced as a risk signal with a live count; moving them back to where they belong is the intended next step and is not yet implemented.
 
 ## Installation
 
@@ -81,11 +81,19 @@ cat plan.json | jq '.'              # review the exact DDL and duration estimate
 pg-partitioner apply --plan-file plan.json --dry-run
 pg-partitioner apply --plan-file plan.json
 
+# Or: create a NEW list-partitioned table from a template, then fill it in
+pg-partitioner plan --schema public --table events \
+  --strategy list --key region --template-table events_template \
+  --output plan.json
+pg-partitioner apply --plan-file plan.json
+pg-partitioner add-partition --schema public --table events \
+  --partition-name events_eu --values eu-west,eu-central
+
 # Automate ongoing premake + retention
 pg-partitioner maintain             # test manually first, then add to cron/systemd/k8s CronJob
 ```
 
-See `QUICK_START.md` for a copy-paste command reference and `PRACTICAL_USE_CASES.md` for worked scenarios (staging validation, fleet monitoring, storage projection, blue/green strategy testing).
+`pg-partitioner <command> --help` is the authoritative flag reference; the walkthroughs below cover the two migrations the tool performs today.
 
 ## How to partition an existing table (date/range partitioning)
 
@@ -149,29 +157,96 @@ pg-partitioner register --schema public --table events \
   --retention-type months --retention-value 12
 ```
 
-`maintain` now actually keeps registered tables' premake window topped up: each run recomputes "today's period through `--premake` periods ahead" and creates whatever's missing — including a partition you deleted by hand, not just extending the tail. **Known gap:** retention enforcement (dropping partitions older than the registered policy) is still a placeholder — `maintain` won't drop anything yet.
+`maintain` now actually keeps registered tables' premake window topped up: each run recomputes "today's period through `--premake` periods ahead" and creates whatever's missing — including a partition you deleted by hand, not just extending the tail. Range tables only — list and hash registrations are skipped, since neither has a "next period" to premake. **Known gap:** retention enforcement (dropping partitions older than the registered policy) is still a placeholder — `maintain` won't drop anything yet.
+
+## How to create a new list-partitioned table
+
+Range partitioning converts a table you already have. List partitioning works the other way
+round: you declare the value sets up front, so there's nothing to convert — the parent is
+created new, from a **template table** that supplies its columns.
+
+```bash
+# 0. A template: an ordinary, existing table used only as a structure source.
+#    It is read, never modified, locked exclusively, or dropped.
+psql -c "CREATE TABLE events_template (
+           id bigserial, region text, tenant_id int NOT NULL,
+           payload jsonb, created_at timestamptz NOT NULL DEFAULT now()
+         )"
+
+# 1. Create the parent — empty, with zero child partitions
+pg-partitioner plan --schema public --table events \
+  --strategy list --key region \
+  --template-table events_template \
+  --output plan.json
+pg-partitioner apply --plan-file plan.json
+
+# 2. Add partitions one value set at a time, as often as you need
+pg-partitioner add-partition --schema public --table events \
+  --partition-name events_eu --values eu-west,eu-central
+pg-partitioner add-partition --schema public --table events \
+  --partition-name events_us --values us-east
+```
+
+`--template-schema` defaults to `--schema`; pass it when the template lives elsewhere. The
+range-only flags (`--interval`, `--premake`, `--start-date`) are **rejected** here rather than
+silently ignored — list partitioning has no time window to premake.
+
+**The parent is created empty and stays that way until you add partitions** — no default
+partition, not even an empty one. A row whose `region` matches no partition is rejected by
+PostgreSQL rather than quietly pooled somewhere you'd have to reconcile it out of later. That
+is deliberate; for a catch-all, create one explicitly:
+
+```bash
+psql -c "CREATE TABLE events_catchall PARTITION OF events DEFAULT"
+```
+
+To partition on a column that can be null, add the partition that holds nulls with the literal
+`NULL` — the one value that isn't a plain string:
+
+```bash
+pg-partitioner add-partition --schema public --table events \
+  --partition-name events_unknown --values NULL
+```
+
+`add-partition` reads the target's strategy from the live catalog rather than trusting a flag,
+so pointing it at a range- or hash-partitioned table (or a plain one) fails with a clear message
+instead of producing DDL PostgreSQL rejects for a less obvious reason. It's safe to re-run:
+the same name with the same values is a no-op, while the same name with *different* values is
+an error rather than a silent skip. Every call goes through the same plan → apply →
+`partitioner_logbook` path as everything else, and `--dry-run` shows the DDL without running it.
+
+Creation is idempotent the same way: if the target already exists as a list-partitioned table
+on the same key, `plan` emits a zero-action plan and says so; if it exists as anything else,
+it's a hard error naming the collision rather than a silent no-op.
+
+**Two things list partitioning does not do yet.** `maintain` skips list tables entirely —
+premake is a time-series idea and there's no "next" value set to derive, so new partitions are
+always an explicit `add-partition` call. And index recreation from the template isn't wired in;
+create indexes on the parent yourself once it has partitions.
 
 ## Commands
 
 ```
 Read-only (always safe, no locks, no writes)
-  inspect     current partitioning state — strategy, children, sizes, risk signals
-  explain     the same state, as a plain-language narrative
-  export      partitioning config to YAML/JSON for version control
+  inspect        current partitioning state — strategy, children, sizes, risk signals
+  explain        the same state, as a plain-language narrative
+  export         partitioning config to YAML/JSON for version control
 
 Setup
-  install     provision pg-partitioner's own config/state/audit tables (under the `partitioner` schema)
+  install        provision pg-partitioner's own config/state/audit tables (under the `partitioner` schema)
 
 Plan → apply
-  plan        compute desired vs. current state, preflight-validate, write a checksummed plan
-  apply       re-checksum live schema against the plan (refuses on drift), execute
+  plan           compute desired vs. current state, preflight-validate, write a checksummed plan
+                 (range: convert an existing table; list: create a new one from --template-table)
+  apply          re-checksum live schema against the plan (refuses on drift), execute
+  add-partition  add one FOR VALUES IN (...) partition to a list-partitioned table
 
 Configuration
-  register    declare a table as managed (or update its strategy/interval/retention/premake)
-  unregister  stop managing a table's partitioning configuration
+  register       declare a table as managed (or update its strategy/interval/retention/premake)
+  unregister     stop managing a table's partitioning configuration
 
 Automation
-  maintain    premake future partitions + enforce retention across registered tables
+  maintain       premake future partitions + enforce retention across registered tables
 ```
 
 Every subcommand supports `--host`/`--port`/`--database`/`--user`/`--password`/`--ssl-mode` (also settable via `PG_*` env vars or a TOML config file), `--log-level`, `--log-format` (`text`/`json`), and `--log-file`. Logging always writes to both the terminal and a log file — by default `$XDG_STATE_HOME/pg-partitioner/pg-partitioner.log` (or `~/.local/state/...` if that's unset), created automatically if missing.
@@ -183,7 +258,12 @@ src/            application source (see docs/project-structure.md for the module
 tests/          integration tests + tests/fixtures/, a numbered zero-to-hero fixture catalog
 docs/           design record — read docs/IMPLEMENTATION_GUIDE.md first
 scripts/        setup_test_env.sh / reset_test_env.sh for the disposable test container
+CLAUDE.md       development guide — Rust/PostgreSQL rules and the workflow for changing this repo
+CHANGELOG.md    what changed, per release
 ```
+
+`docs/` and `tests/fixtures/` are gitignored: they're a local design record and fixture catalog,
+not shipped content. Start from `CLAUDE.md` if you're making a change here.
 
 ## Testing against a real database
 
@@ -201,7 +281,30 @@ See `docs/test_environment.md` for the full fixture catalog and what each one ex
 
 ## Status
 
-Phases 0–4 of the roadmap (`docs/roadmap.md`) are implemented: read-only discovery, guided plan/apply, operational guardrails (lock/timeout discipline, proactive risk detection), fleet-oriented maintenance, and early differentiation features (storage projection, blue/green strategy testing). See `COMPLETE_IMPLEMENTATION.md` for the phase-by-phase breakdown and what's still a stub pending integration testing against the fixture catalog.
+Working today, exercised end-to-end against a real PostgreSQL 16:
+
+- **Read-only discovery** — `inspect`, `explain`, `export`, risk signals.
+- **Range partitioning of an existing table** — `plan` → `apply`, the full ATTACH-first cutover,
+  with drift detection and auto-registration.
+- **List partitioning** — creating a parent from a template, plus `add-partition` for adding
+  value sets one at a time.
+- **Metadata and config** — `install`, `register`/`unregister`, and the `partitioner_logbook`
+  audit trail every DDL action writes to.
+- **Premake maintenance** — `maintain` and the long-running `daemon`, for range tables.
+
+Not yet implemented, despite appearing in some older design notes:
+
+- **Hash partitioning.** `--strategy hash` parses but has no execution path. Hash tables can't
+  have a DEFAULT partition, so the cutover flow is structurally impossible for them; they'd have
+  to go through template creation, which currently accepts list only.
+- **Retention enforcement.** `--retention-type`/`--retention-value` are stored but nothing drops
+  a partition yet.
+- **Bulk-copy migration**, the fallback for tables that can't be attached as one range.
+- **Index recreation in the template flow**, and a DEFAULT partition for list tables.
+
+Treat anything in `docs/` claiming broader completeness as a design record rather than a
+description of the shipped tool — several of those files predate the code and describe commands
+that no longer exist.
 
 ## License
 

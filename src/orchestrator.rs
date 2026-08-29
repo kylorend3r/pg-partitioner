@@ -32,8 +32,13 @@ impl Orchestrator {
         // Computed once for the whole plan (not per-action, not at plan time):
         // AddConstraint and AttachPartition must see the identical boundary
         // value for Postgres's ATTACH fast-path (skip-validation-scan) to work.
+        //
+        // Only the range cutover flow has boundaries at all. Template creation
+        // and single-list-partition adds have no period to compute, and
+        // demanding a `start_date` from them would reject perfectly valid plans
+        // over a field that means nothing to either.
         let boundaries: Option<Vec<String>> = match migration_config {
-            Some(config) => {
+            Some(config) if config.needs_range_boundaries() => {
                 let start_date = config.start_date.as_deref().ok_or_else(|| {
                     anyhow!("migration_config missing start_date; re-run `plan` to regenerate it")
                 })?;
@@ -47,7 +52,7 @@ impl Orchestrator {
                     .await?,
                 )
             }
-            None => None,
+            _ => None,
         };
 
         let mut results = Vec::new();
@@ -145,9 +150,69 @@ impl Orchestrator {
                 let config = migration_config.ok_or_else(|| {
                     anyhow!("CreatePartitionSet requires migration_config; re-run `plan` to regenerate it")
                 })?;
-                migration::create_partitioned_shadow_table(client, schema, table, config, &self.retry_policy)
-                    .await?;
-                Ok(())
+
+                match config.template_table.as_deref() {
+                    // Template flow: the new table is created directly under
+                    // its final name, since there's no rename-swap to keep
+                    // that name free for.
+                    Some(template) => {
+                        let (template_schema, template_table) = split_table_name(template)?;
+
+                        // Re-run the idempotency check against the live catalog
+                        // rather than trusting the plan: an arbitrary amount of
+                        // time can pass between `plan` and `apply`, and the
+                        // `CREATE TABLE IF NOT EXISTS` below would otherwise
+                        // silently no-op over a table that had appeared in the
+                        // meantime with a different shape.
+                        match migration::classify_template_target(
+                            client,
+                            schema,
+                            table,
+                            config.partition_strategy,
+                            &config.partition_key,
+                        )
+                        .await?
+                        {
+                            migration::TemplateTargetState::Conflict(detail) => Err(anyhow!(
+                                "Cannot create {}.{}: {}",
+                                schema,
+                                table,
+                                detail
+                            )),
+                            migration::TemplateTargetState::AlreadyMatches => {
+                                info!(
+                                    table = action.table_name,
+                                    "Target is already partitioned as requested; nothing to create"
+                                );
+                                Ok(())
+                            }
+                            migration::TemplateTargetState::Absent => {
+                                migration::create_partitioned_table_from_template(
+                                    client,
+                                    template_schema,
+                                    template_table,
+                                    schema,
+                                    table,
+                                    config.partition_strategy,
+                                    &config.partition_key,
+                                    &self.retry_policy,
+                                )
+                                .await
+                            }
+                        }
+                    }
+                    None => {
+                        migration::create_partitioned_shadow_table(
+                            client,
+                            schema,
+                            table,
+                            config,
+                            &self.retry_policy,
+                        )
+                        .await?;
+                        Ok(())
+                    }
+                }
             }
 
             ActionType::AttachPartition => {
@@ -169,6 +234,32 @@ impl Orchestrator {
             }
 
             ActionType::CreatePartition => {
+                // `add-partition`: one explicitly-named list child, no default.
+                // A list-partitioned table gets no DEFAULT partition from this
+                // tool at all — rows with an unlisted value are rejected rather
+                // than quietly pooled somewhere they'd later have to be
+                // reconciled out of.
+                if let Some(config) = migration_config {
+                    if let Some(values) = config.list_partition_values.as_deref() {
+                        let partition_name =
+                            config.list_partition_name.as_deref().ok_or_else(|| {
+                                anyhow!(
+                                    "migration_config has list_partition_values but no \
+                                     list_partition_name; re-run `plan` to regenerate it"
+                                )
+                            })?;
+                        return migration::create_list_partition(
+                            client,
+                            schema,
+                            table,
+                            partition_name,
+                            values,
+                            &self.retry_policy,
+                        )
+                        .await;
+                    }
+                }
+
                 migration::create_default_partition(client, schema, table, &self.retry_policy).await?;
 
                 if let Some(boundaries) = boundaries {

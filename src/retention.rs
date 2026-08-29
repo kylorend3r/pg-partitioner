@@ -53,8 +53,8 @@ async fn get_partitions_older_than_days(
             WHERE inhparent = {}::regclass
         )
         "#,
-        queries::quote_ident(table_name),
-        queries::quote_ident(table_name)
+        queries::quote_regclass_literal(table_name),
+        queries::quote_regclass_literal(table_name)
     );
 
     let rows = client.query(&query, &[]).await?;
@@ -111,9 +111,9 @@ async fn get_partitions_beyond_count(
                 )
         )
         "#,
-        queries::quote_ident(table_name),
+        queries::quote_regclass_literal(table_name),
         keep_count,
-        queries::quote_ident(table_name)
+        queries::quote_regclass_literal(table_name)
     );
 
     let rows = client.query(&query, &[]).await?;

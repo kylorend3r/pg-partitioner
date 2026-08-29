@@ -5,7 +5,7 @@ use tracing::info;
 
 use crate::migration;
 use crate::schema;
-use crate::types::{PartitionRegistration, RetryPolicy};
+use crate::types::{PartitionRegistration, PartitionStrategy, RetryPolicy};
 
 pub struct Maintainer;
 
@@ -18,10 +18,26 @@ impl Maintainer {
     /// partitions on `registration`'s table, creating whatever's missing —
     /// including gaps from a manually-dropped partition, not just extending
     /// the tail, since the target window is recomputed fresh every call.
+    ///
+    /// Range only. Premake is a time-series idea: it extends a `FOR VALUES
+    /// FROM/TO` sequence into the future. List has no "next period" to
+    /// premake — its partitions are added deliberately, one value set at a
+    /// time, via `add-partition` — and hash's buckets are all fixed at
+    /// creation. Running the range DDL against either would fail on every
+    /// sweep, so both are skipped outright.
     pub async fn premake_future_partitions(
         client: &Client,
         registration: &PartitionRegistration,
     ) -> Result<Vec<String>> {
+        if registration.strategy != PartitionStrategy::Range {
+            info!(
+                table = format!("{}.{}", registration.schema_name, registration.table_name),
+                strategy = registration.strategy.as_registration_str(),
+                "Skipping premake: only range-partitioned tables have a forward window"
+            );
+            return Ok(Vec::new());
+        }
+
         let retry_policy = RetryPolicy::default();
         let boundaries = migration::compute_forward_boundaries(
             client,

@@ -28,6 +28,28 @@ impl PartitionStrategy {
             other => Err(anyhow!("Unknown partition strategy: {}", other)),
         }
     }
+
+    /// The keyword PostgreSQL expects in `PARTITION BY {…}` DDL — distinct
+    /// again from both the registration strings above and the catalog's
+    /// single-letter codes.
+    pub fn as_sql_keyword(&self) -> &'static str {
+        match self {
+            PartitionStrategy::Range => "RANGE",
+            PartitionStrategy::List => "LIST",
+            PartitionStrategy::Hash => "HASH",
+        }
+    }
+
+    /// Parses `pg_partitioned_table.partstrat`. Read as `::text` (never as the
+    /// raw `"char"` OID) — see `queries::QUERY_PARTITIONED_TABLES`.
+    pub fn from_partstrat(code: &str) -> Result<Self> {
+        match code {
+            "r" => Ok(PartitionStrategy::Range),
+            "l" => Ok(PartitionStrategy::List),
+            "h" => Ok(PartitionStrategy::Hash),
+            other => Err(anyhow!("Unknown pg_partitioned_table.partstrat: {}", other)),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -173,6 +195,15 @@ pub struct Plan {
     /// still deserialize as `None` instead of failing.
     #[serde(default)]
     pub migration_config: Option<MigrationConfig>,
+    /// Which table `schema_checksum` was computed over, as `schema.table`.
+    /// `None` means "the table the plan's actions target" — true for every
+    /// cutover plan, where the source table *is* the structural source. The
+    /// template-creation flow sets this to the **template** table instead:
+    /// its target doesn't exist yet at plan time, so there's nothing to
+    /// checksum there, while the template is exactly what the target's
+    /// structure is copied from and therefore the thing worth drift-checking.
+    #[serde(default)]
+    pub checksum_table: Option<String>,
     #[serde(default)]
     pub warnings: Vec<String>,
 }
@@ -257,6 +288,33 @@ pub struct MigrationConfig {
     /// written before this field existed, even though the CLI requires it.
     #[serde(default)]
     pub start_date: Option<String>,
+    /// `schema.table` of a separate, already-existing table used purely as a
+    /// structure source (`LIKE … INCLUDING DEFAULTS`). Its presence switches
+    /// planning from the ATTACH-first cutover flow to the additive
+    /// "create a new partitioned table" flow — the template itself is never
+    /// modified, locked exclusively, or dropped.
+    #[serde(default)]
+    pub template_table: Option<String>,
+    /// Name of the single child partition an `add-partition` plan creates.
+    #[serde(default)]
+    pub list_partition_name: Option<String>,
+    /// Values for that child's `FOR VALUES IN (…)` bound. Presence of this
+    /// field is what makes the orchestrator's `CreatePartition` step build a
+    /// list partition instead of the range default+premake set.
+    #[serde(default)]
+    pub list_partition_values: Option<Vec<String>>,
+}
+
+impl MigrationConfig {
+    /// True when this config drives the range-shaped boundary machinery
+    /// (`start_date` + `interval` + premake). False for both new flows —
+    /// template creation and single-list-partition adds — neither of which
+    /// has a period boundary to compute.
+    pub fn needs_range_boundaries(&self) -> bool {
+        self.partition_strategy == PartitionStrategy::Range
+            && self.template_table.is_none()
+            && self.list_partition_values.is_none()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

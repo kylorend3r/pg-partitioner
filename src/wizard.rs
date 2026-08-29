@@ -21,6 +21,9 @@ impl SetupWizard {
             use_bulk_copy: false,
             retention_policy: None,
             start_date: None,
+            template_table: None,
+            list_partition_name: None,
+            list_partition_values: None,
         };
 
         Ok(config)
@@ -42,10 +45,16 @@ mod tests {
             use_bulk_copy: false,
             retention_policy: None,
             start_date: None,
+            template_table: None,
+            list_partition_name: None,
+            list_partition_values: None,
         };
 
         assert_eq!(config.interval, "1 month");
         assert_eq!(config.premake_count, 3);
         assert!(!config.use_bulk_copy);
+        // A plain range cutover config is the one shape that drives the
+        // period-boundary machinery.
+        assert!(config.needs_range_boundaries());
     }
 }

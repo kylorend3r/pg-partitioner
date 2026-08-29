@@ -3,6 +3,17 @@ use tokio_postgres::Client;
 
 pub const QUERY_SERVER_VERSION: &str = "SELECT current_setting('server_version_num')::int;";
 
+// Relation-name parameters below are cast `$1::text::regclass`, never bare
+// `$1::regclass`. An explicit cast is what Postgres's DESCRIBE step uses to
+// infer the parameter's type, so `$1::regclass` reports the parameter as
+// `regclass` — and tokio-postgres's `ToSql` for `&str`/`String` accepts only
+// text-family OIDs, so binding a Rust string against it fails at runtime.
+// Routing through `::text` first pins the parameter to text and lets Postgres
+// do the regclass lookup afterwards. Same trap as the `::interval`/`::jsonb`
+// cases documented in `migration::compute_partition_boundaries`; for queries
+// built with `format!` rather than bound parameters, use
+// `quote_regclass_literal` instead.
+
 pub const QUERY_PARTITIONED_TABLES: &str = r#"
     SELECT
         t.oid,
@@ -23,7 +34,7 @@ pub const QUERY_PARTITIONED_TABLES: &str = r#"
 
 pub const QUERY_TABLE_SIZE: &str = r#"
     SELECT
-        pg_total_relation_size($1::regclass)::bigint as size_bytes;
+        pg_total_relation_size($1::text::regclass)::bigint as size_bytes;
 "#;
 
 /// Approximate row count via `pg_stat_user_tables.n_live_tup` rather than
@@ -36,7 +47,7 @@ pub const QUERY_TABLE_SIZE: &str = r#"
 pub const QUERY_TABLE_ROW_COUNT: &str = r#"
     SELECT COALESCE(n_live_tup, 0) as row_count
     FROM pg_stat_user_tables
-    WHERE relid = $1::regclass;
+    WHERE relid = $1::text::regclass;
 "#;
 
 pub const QUERY_CHILD_PARTITIONS: &str = r#"
@@ -54,7 +65,7 @@ pub const QUERY_CHILD_PARTITIONS: &str = r#"
     LEFT JOIN pg_constraint con ON con.conrelid = c.oid
         AND con.contype = 'c'
         AND con.conislocal
-    WHERE p.oid = $1::regclass
+    WHERE p.oid = $1::text::regclass
     ORDER BY c.relname;
 "#;
 
@@ -65,7 +76,7 @@ pub const QUERY_TABLE_CONSTRAINTS: &str = r#"
         con.contype as constraint_type,
         pg_get_constraintdef(con.oid) as definition
     FROM pg_constraint con
-    WHERE con.conrelid = $1::regclass
+    WHERE con.conrelid = $1::text::regclass
         AND con.contype IN ('p', 'u', 'f', 'c', 'x')
     ORDER BY con.contype, con.conname;
 "#;
@@ -79,7 +90,7 @@ pub const QUERY_TABLE_INDEXES: &str = r#"
         ix.indisprimary as is_primary
     FROM pg_class i
     JOIN pg_index ix ON ix.indexrelid = i.oid
-    WHERE ix.indrelid = $1::regclass
+    WHERE ix.indrelid = $1::text::regclass
         AND i.relkind = 'i'
     ORDER BY i.relname;
 "#;
@@ -91,13 +102,9 @@ pub const QUERY_DEFAULT_PARTITION: &str = r#"
     FROM pg_class p
     JOIN pg_inherits i ON p.oid = i.inhparent
     JOIN pg_class c ON c.oid = i.inhrelid
-    WHERE p.oid = $1::regclass
+    WHERE p.oid = $1::text::regclass
         AND i.inhdetachpending = false
-        AND NOT EXISTS (
-            SELECT 1 FROM pg_constraint con
-            WHERE con.conrelid = c.oid
-                AND con.contype = 'c'
-        )
+        AND pg_get_expr(c.relpartbound, c.oid) = 'DEFAULT'
     LIMIT 1;
 "#;
 
@@ -110,7 +117,7 @@ pub const QUERY_PARTITION_STATISTICS: &str = r#"
         last_vacuum,
         last_autovacuum
     FROM pg_stat_user_tables
-    WHERE relid = $1::regclass;
+    WHERE relid = $1::text::regclass;
 "#;
 
 pub const QUERY_UNIQUE_INDEXES: &str = r#"
@@ -122,7 +129,7 @@ pub const QUERY_UNIQUE_INDEXES: &str = r#"
     JOIN pg_index ix ON ix.indexrelid = i.oid
     JOIN pg_attribute a ON a.attrelid = ix.indrelid
         AND a.attnum = ANY(ix.indkey)
-    WHERE ix.indrelid = $1::regclass
+    WHERE ix.indrelid = $1::text::regclass
         AND ix.indisunique
     GROUP BY i.oid, i.relname
     ORDER BY i.relname;
@@ -134,7 +141,7 @@ pub const QUERY_FOREIGN_KEY_DEPENDENTS: &str = r#"
         c.relname as dependent_table,
         n.nspname as schema_name
     FROM pg_constraint con
-    WHERE con.confrelid = $1::regclass
+    WHERE con.confrelid = $1::text::regclass
         AND con.contype = 'f'
     JOIN pg_class c ON c.oid = con.conrelid
     JOIN pg_namespace n ON n.oid = c.relnamespace;
@@ -148,7 +155,7 @@ pub const QUERY_DEPENDENT_VIEWS: &str = r#"
     FROM pg_depend d
     JOIN pg_class c ON c.oid = d.objid
     JOIN pg_namespace n ON n.oid = c.relnamespace
-    WHERE d.refobjid = $1::regclass
+    WHERE d.refobjid = $1::text::regclass
         AND c.relkind = 'v'
         AND d.deptype = 'n';
 "#;
@@ -187,6 +194,32 @@ pub fn quote_ident(identifier: &str) -> String {
 
 pub fn quote_literal(value: &str) -> String {
     format!("'{}'", value.replace("'", "''"))
+}
+
+/// Renders a possibly schema-qualified relation name as a **string literal**
+/// suitable for a `::regclass` cast or a `regclass`-typed argument such as
+/// `pg_total_relation_size(…)`.
+///
+/// This is not interchangeable with `quote_ident`, and reaching for that one
+/// here is a silent failure rather than a loud one: `quote_ident("public.events")`
+/// yields `"public.events"` — a single double-quoted identifier containing a
+/// dot — so `"public.events"::regclass` parses as a cast of a *column
+/// reference* and fails with `column "public.events" does not exist`. Callers
+/// that wrap such a query in `.unwrap_or_default()` then report a plausible
+/// zero instead of an error.
+///
+/// Each part is quoted as an identifier *inside* the literal, so mixed-case and
+/// otherwise-nonstandard names survive regclass's identifier folding:
+/// `public.MyTable` becomes `'"public"."MyTable"'`. An unqualified name is
+/// left unqualified and resolves through `search_path`, as it would anywhere
+/// else.
+pub fn quote_regclass_literal(qualified_name: &str) -> String {
+    let quoted = match qualified_name.split_once('.') {
+        Some((schema, table)) => format!("{}.{}", quote_ident(schema), quote_ident(table)),
+        None => quote_ident(qualified_name),
+    };
+
+    quote_literal(&quoted)
 }
 
 pub async fn get_table_oid(client: &Client, schema: &str, table: &str) -> Result<Option<u32>> {
@@ -231,5 +264,26 @@ mod tests {
     fn test_quote_literal() {
         assert_eq!(quote_literal("simple"), "'simple'");
         assert_eq!(quote_literal("it's"), "'it''s'");
+    }
+
+    #[test]
+    fn test_quote_regclass_literal() {
+        // The dot separates identifiers; it must not end up *inside* one.
+        assert_eq!(
+            quote_regclass_literal("public.events"),
+            "'\"public\".\"events\"'"
+        );
+        // Unqualified names stay unqualified (resolved via search_path).
+        assert_eq!(quote_regclass_literal("events"), "'\"events\"'");
+        // Quoting each part is what keeps mixed case from being folded away.
+        assert_eq!(
+            quote_regclass_literal("public.MyTable"),
+            "'\"public\".\"MyTable\"'"
+        );
+        // Embedded quotes are escaped for both layers.
+        assert_eq!(
+            quote_regclass_literal("public.od'd"),
+            "'\"public\".\"od''d\"'"
+        );
     }
 }

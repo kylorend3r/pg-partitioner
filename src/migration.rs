@@ -3,7 +3,7 @@ use tokio_postgres::Client;
 
 use crate::queries;
 use crate::retry;
-use crate::types::{MigrationConfig, RetryPolicy};
+use crate::types::{MigrationConfig, PartitionKey, PartitionStrategy, RetryPolicy};
 
 pub struct MigrationPlan {
     pub method: MigrationMethod,
@@ -249,11 +249,7 @@ pub async fn create_partitioned_shadow_table(
     let shadow_name = format!("{}_partitioned_new", table);
     let partition_columns = config.partition_key.columns.join(", ");
 
-    let strategy_str = match config.partition_strategy {
-        crate::types::PartitionStrategy::Range => "RANGE",
-        crate::types::PartitionStrategy::List => "LIST",
-        crate::types::PartitionStrategy::Hash => "HASH",
-    };
+    let strategy_str = config.partition_strategy.as_sql_keyword();
 
     // `LIKE ... INCLUDING DEFAULTS` (not `INCLUDING ALL`/`INCLUDING
     // CONSTRAINTS`/`INCLUDING INDEXES`): a partitioned table's own column
@@ -278,6 +274,307 @@ pub async fn create_partitioned_shadow_table(
         .await?;
 
     Ok(shadow_name)
+}
+
+/// What a template-creation run would find waiting for it at the target name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TemplateTargetState {
+    /// Nothing occupies the target name — create it.
+    Absent,
+    /// The target is already a partitioned table with exactly the requested
+    /// strategy and partition key — nothing to do.
+    AlreadyMatches,
+    /// Something else already owns the name. The string explains what.
+    Conflict(String),
+}
+
+fn keys_equal(left: &PartitionKey, right: &PartitionKey) -> bool {
+    left.columns.len() == right.columns.len()
+        && left
+            .columns
+            .iter()
+            .zip(right.columns.iter())
+            .all(|(a, b)| a.eq_ignore_ascii_case(b))
+}
+
+/// Implements the template flow's "create if not exists" rule against the live
+/// catalog: absent → create, already-matching → no-op, anything else → hard
+/// error. Called twice per run — once at plan time so a conflict is reported
+/// before a plan file is even written, and again by the orchestrator at apply
+/// time, since an arbitrary amount of time (and other people's DDL) can pass
+/// between the two.
+pub async fn classify_template_target(
+    client: &Client,
+    schema: &str,
+    table: &str,
+    strategy: PartitionStrategy,
+    partition_key: &PartitionKey,
+) -> Result<TemplateTargetState> {
+    match crate::schema::get_partition_strategy_and_key(client, schema, table).await? {
+        Some((live_strategy, live_key)) => {
+            if live_strategy != strategy {
+                return Ok(TemplateTargetState::Conflict(format!(
+                    "{}.{} already exists and is partitioned BY {}, not BY {}",
+                    schema,
+                    table,
+                    live_strategy.as_sql_keyword(),
+                    strategy.as_sql_keyword()
+                )));
+            }
+            if !keys_equal(&live_key, partition_key) {
+                return Ok(TemplateTargetState::Conflict(format!(
+                    "{}.{} already exists and is partitioned BY {} ({}), not ({})",
+                    schema,
+                    table,
+                    strategy.as_sql_keyword(),
+                    live_key.columns.join(", "),
+                    partition_key.columns.join(", ")
+                )));
+            }
+            Ok(TemplateTargetState::AlreadyMatches)
+        }
+        None => {
+            if crate::schema::table_exists(client, schema, table).await? {
+                Ok(TemplateTargetState::Conflict(format!(
+                    "{}.{} already exists and is not a partitioned table",
+                    schema, table
+                )))
+            } else {
+                Ok(TemplateTargetState::Absent)
+            }
+        }
+    }
+}
+
+/// Creates a brand-new partitioned table whose column definitions come from a
+/// separate template table.
+///
+/// This is the additive counterpart to `create_partitioned_shadow_table`: no
+/// shadow name and no later rename, because nothing is being swapped — the
+/// table is created directly under its final name. The template is only ever
+/// read (`LIKE`), never locked exclusively, altered, or dropped.
+///
+/// `INCLUDING DEFAULTS` and nothing more, for the same reason the cutover path
+/// gives: pulling in the template's unique/PK constraints or indexes would
+/// fail outright whenever they don't include the partition key, which is the
+/// normal case for a surrogate-keyed table.
+pub async fn create_partitioned_table_from_template(
+    client: &Client,
+    template_schema: &str,
+    template_table: &str,
+    target_schema: &str,
+    target_table: &str,
+    strategy: PartitionStrategy,
+    partition_key: &PartitionKey,
+    retry_policy: &RetryPolicy,
+) -> Result<()> {
+    let partition_columns = partition_key
+        .columns
+        .iter()
+        .map(|c| queries::quote_ident(c))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let query = format!(
+        "CREATE TABLE IF NOT EXISTS {}.{} (LIKE {}.{} INCLUDING DEFAULTS) PARTITION BY {} ({})",
+        queries::quote_ident(target_schema),
+        queries::quote_ident(target_table),
+        queries::quote_ident(template_schema),
+        queries::quote_ident(template_table),
+        strategy.as_sql_keyword(),
+        partition_columns,
+    );
+
+    retry::execute_batch_with_retry(
+        client,
+        "create_partitioned_table_from_template",
+        &query,
+        retry_policy,
+    )
+    .await
+}
+
+/// Renders values for a `FOR VALUES IN (…)` bound. A value of `NULL` (in any
+/// case) is emitted as the SQL null keyword rather than the four-character
+/// string — that's the only way to declare the partition that catches null
+/// partition-key values, and there is no other way to spell it on a command
+/// line. Everything else is quoted as a string literal and left for PostgreSQL
+/// to coerce to the partition key's own type, which it does for numeric,
+/// uuid, enum, and date/time keys alike.
+pub fn format_list_values(values: &[String]) -> String {
+    values
+        .iter()
+        .map(|v| {
+            if v.eq_ignore_ascii_case("null") {
+                "NULL".to_string()
+            } else {
+                queries::quote_literal(v)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Adds one `FOR VALUES IN (…)` child to an existing list-partitioned table.
+///
+/// Neither value-set overlap with a sibling partition nor a type mismatch
+/// against the partition key is checked ahead of time: PostgreSQL raises a
+/// clear, specific error for both at DDL time, and re-deriving those checks
+/// here would only duplicate a constraint the server already enforces
+/// authoritatively.
+///
+/// `IF NOT EXISTS` matches `create_range_partition`/`create_default_partition`,
+/// making a re-run after a partial failure safe. Whether the partition that
+/// already exists under that name is the *same* partition is settled before we
+/// get here, by `validation::validate_add_list_partition`.
+pub async fn create_list_partition(
+    client: &Client,
+    schema: &str,
+    table: &str,
+    partition_name: &str,
+    values: &[String],
+    retry_policy: &RetryPolicy,
+) -> Result<()> {
+    if values.is_empty() {
+        return Err(anyhow::anyhow!(
+            "cannot create list partition {}.{} with an empty value set",
+            schema,
+            partition_name
+        ));
+    }
+
+    let query = format!(
+        "CREATE TABLE IF NOT EXISTS {}.{} PARTITION OF {}.{} FOR VALUES IN ({})",
+        queries::quote_ident(schema),
+        queries::quote_ident(partition_name),
+        queries::quote_ident(schema),
+        queries::quote_ident(table),
+        format_list_values(values),
+    );
+
+    retry::execute_batch_with_retry(client, "create_list_partition", &query, retry_policy).await
+}
+
+/// Pulls the value set back out of a bound as PostgreSQL renders it —
+/// `FOR VALUES IN ('a', 'b')`, `FOR VALUES IN (1, 2)`,
+/// `FOR VALUES IN ('shipped'::order_state)` — so an existing partition can be
+/// compared against a requested one. Returns `None` for anything that isn't a
+/// list bound at all (a range bound, `DEFAULT`, or an unterminated literal).
+///
+/// Quoting is dropped and any trailing `::type` cast ignored, which leaves one
+/// blind spot: an unquoted SQL `NULL` normalizes to `"NULL"`, so a partition
+/// holding the *text* value `'NULL'` compares equal to the null partition. That
+/// costs a spurious "already present" no-op in a case no real schema hits.
+pub fn parse_list_bound_values(bound_expr: &str) -> Option<Vec<String>> {
+    const MARKER: &str = "FOR VALUES IN";
+
+    let trimmed = bound_expr.trim();
+    let marker_at = trimmed.to_ascii_uppercase().find(MARKER)?;
+    let after = trimmed[marker_at + MARKER.len()..].trim_start();
+    let inner = after.strip_prefix('(')?;
+    let inner = &inner[..inner.rfind(')')?];
+
+    let chars: Vec<char> = inner.chars().collect();
+    let mut idx = 0usize;
+    let mut values = Vec::new();
+
+    while idx < chars.len() {
+        while idx < chars.len() && chars[idx].is_whitespace() {
+            idx += 1;
+        }
+        if idx >= chars.len() {
+            break;
+        }
+
+        let value = if chars[idx] == '\'' {
+            idx += 1;
+            let mut literal = String::new();
+            loop {
+                if idx >= chars.len() {
+                    return None; // unterminated literal — not a bound we understand
+                }
+                if chars[idx] == '\'' {
+                    // Doubled quote is an escaped quote, not the terminator.
+                    if chars.get(idx + 1) == Some(&'\'') {
+                        literal.push('\'');
+                        idx += 2;
+                    } else {
+                        idx += 1;
+                        break;
+                    }
+                } else {
+                    literal.push(chars[idx]);
+                    idx += 1;
+                }
+            }
+            literal
+        } else {
+            let mut raw = String::new();
+            let mut depth = 0usize;
+            while idx < chars.len() {
+                match chars[idx] {
+                    '(' => depth += 1,
+                    ')' => depth = depth.saturating_sub(1),
+                    ',' if depth == 0 => break,
+                    _ => {}
+                }
+                raw.push(chars[idx]);
+                idx += 1;
+            }
+            let raw = raw.trim().to_string();
+            if raw.eq_ignore_ascii_case("null") {
+                "NULL".to_string()
+            } else {
+                raw
+            }
+        };
+
+        // Skip whatever trails the value up to the next top-level comma: a
+        // `::type` cast, which may itself carry parenthesised, comma-bearing
+        // modifiers such as `::numeric(10,2)`.
+        let mut depth = 0usize;
+        while idx < chars.len() {
+            match chars[idx] {
+                '(' => depth += 1,
+                ')' => depth = depth.saturating_sub(1),
+                ',' if depth == 0 => {
+                    idx += 1;
+                    break;
+                }
+                _ => {}
+            }
+            idx += 1;
+        }
+
+        values.push(value);
+    }
+
+    Some(values)
+}
+
+/// Whether an existing partition's rendered bound describes the same value set
+/// as `values`. Order-insensitive and duplicate-insensitive, because
+/// `FOR VALUES IN ('b', 'a')` and `FOR VALUES IN ('a', 'b')` are the same
+/// partition.
+pub fn list_bound_matches(existing_bound: &str, values: &[String]) -> bool {
+    // Only the requested side needs folding: `parse_list_bound_values` has
+    // already mapped an unquoted SQL `NULL` to `"NULL"`, and deliberately left
+    // a *quoted* `'null'` alone so the two don't collapse into each other.
+    let requested: std::collections::BTreeSet<String> = values
+        .iter()
+        .map(|v| {
+            if v.eq_ignore_ascii_case("null") {
+                "NULL".to_string()
+            } else {
+                v.clone()
+            }
+        })
+        .collect();
+
+    match parse_list_bound_values(existing_bound) {
+        Some(existing) => existing.into_iter().collect::<std::collections::BTreeSet<_>>() == requested,
+        None => false,
+    }
 }
 
 pub async fn add_check_constraint(
@@ -524,6 +821,91 @@ mod tests {
             date_range_partition_name("products", "2026-07-22", "2026-07-23"),
             "products_2026_07_22_2026_07_23"
         );
+    }
+
+    #[test]
+    fn test_format_list_values() {
+        assert_eq!(
+            format_list_values(&["eu-west".to_string(), "us-east".to_string()]),
+            "'eu-west', 'us-east'"
+        );
+        // Numeric/uuid values stay quoted: PostgreSQL coerces the literal to
+        // the partition key's own type.
+        assert_eq!(format_list_values(&["1".to_string()]), "'1'");
+        assert_eq!(format_list_values(&["it's".to_string()]), "'it''s'");
+        // `NULL` in any case is the SQL keyword, not the 4-character string.
+        assert_eq!(
+            format_list_values(&["null".to_string(), "a".to_string()]),
+            "NULL, 'a'"
+        );
+    }
+
+    #[test]
+    fn test_parse_list_bound_values() {
+        assert_eq!(
+            parse_list_bound_values("FOR VALUES IN ('eu-west', 'us-east')"),
+            Some(vec!["eu-west".to_string(), "us-east".to_string()])
+        );
+        // Integer keys render unquoted.
+        assert_eq!(
+            parse_list_bound_values("FOR VALUES IN (1, 2, 3)"),
+            Some(vec!["1".to_string(), "2".to_string(), "3".to_string()])
+        );
+        // Escaped quotes, and casts that Postgres appends for enum/domain keys.
+        assert_eq!(
+            parse_list_bound_values("FOR VALUES IN ('it''s')"),
+            Some(vec!["it's".to_string()])
+        );
+        assert_eq!(
+            parse_list_bound_values("FOR VALUES IN ('shipped'::order_state, 'held'::order_state)"),
+            Some(vec!["shipped".to_string(), "held".to_string()])
+        );
+        // A cast carrying its own comma-bearing modifier must not split.
+        assert_eq!(
+            parse_list_bound_values("FOR VALUES IN ('1.0'::numeric(10,2))"),
+            Some(vec!["1.0".to_string()])
+        );
+        // Unquoted NULL normalizes to the keyword.
+        assert_eq!(
+            parse_list_bound_values("FOR VALUES IN (NULL)"),
+            Some(vec!["NULL".to_string()])
+        );
+        // Non-list bounds aren't list bounds.
+        assert_eq!(
+            parse_list_bound_values("FOR VALUES FROM ('2026-01-01') TO ('2026-02-01')"),
+            None
+        );
+        assert_eq!(parse_list_bound_values("DEFAULT"), None);
+    }
+
+    #[test]
+    fn test_list_bound_matches() {
+        let values = vec!["eu-west".to_string(), "us-east".to_string()];
+
+        assert!(list_bound_matches(
+            "FOR VALUES IN ('eu-west', 'us-east')",
+            &values
+        ));
+        // Order and duplicates don't define a different partition.
+        assert!(list_bound_matches(
+            "FOR VALUES IN ('us-east', 'eu-west')",
+            &values
+        ));
+        assert!(!list_bound_matches("FOR VALUES IN ('eu-west')", &values));
+        assert!(!list_bound_matches("DEFAULT", &values));
+
+        // Numeric values survive the quoted-in/unquoted-out round trip.
+        assert!(list_bound_matches(
+            "FOR VALUES IN (1, 2)",
+            &["1".to_string(), "2".to_string()]
+        ));
+
+        // A quoted 'null' is the text value, not the null partition.
+        assert!(list_bound_matches("FOR VALUES IN (NULL)", &["null".to_string()]));
+        assert!(!list_bound_matches(
+            "FOR VALUES IN ('null')",
+            &["null".to_string()]
+        ));
     }
 
     #[test]

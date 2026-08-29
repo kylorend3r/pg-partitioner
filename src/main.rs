@@ -81,13 +81,18 @@ enum Commands {
         table: Option<String>,
     },
 
-    /// Plan a partitioning migration
+    /// Plan a partitioning migration.
+    ///
+    /// Without --template-table this converts the existing --schema/--table
+    /// into a partitioned table (ATTACH-first cutover). With it, --schema/
+    /// --table name a *new* table to create from that template instead; the
+    /// template is only read, never modified or dropped.
     Plan {
-        /// Schema name
+        /// Schema name (of the table to convert, or of the table to create)
         #[arg(long)]
         schema: String,
 
-        /// Table name
+        /// Table name (of the table to convert, or of the table to create)
         #[arg(long)]
         table: String,
 
@@ -96,14 +101,27 @@ enum Commands {
         strategy: String,
 
         /// Partition key column(s), comma-separated for composite keys
+        /// (list partitioning accepts exactly one column)
         #[arg(long, value_delimiter = ',', required = true)]
         key: Vec<String>,
 
-        #[arg(long, default_value = "1 month")]
-        interval: String,
+        /// Schema of the template table (defaults to --schema)
+        #[arg(long, requires = "template_table")]
+        template_schema: Option<String>,
 
-        #[arg(long, default_value_t = 3)]
-        premake: usize,
+        /// Create --schema.--table as a new partitioned table whose columns
+        /// are copied from this template table, instead of converting an
+        /// existing table
+        #[arg(long)]
+        template_table: Option<String>,
+
+        /// Range only. Defaults to "1 month"
+        #[arg(long)]
+        interval: Option<String>,
+
+        /// Range only. Defaults to 3
+        #[arg(long)]
+        premake: Option<usize>,
 
         /// days | months | years | count — must be paired with --retention-value
         #[arg(long)]
@@ -112,10 +130,11 @@ enum Commands {
         #[arg(long)]
         retention_value: Option<i32>,
 
-        /// Minimum date (YYYY-MM-DD) to start real per-period partitions
-        /// from; data older than this lands in one legacy partition instead
+        /// Range cutover only, and required there: minimum date (YYYY-MM-DD)
+        /// to start real per-period partitions from; data older than this
+        /// lands in one legacy partition instead
         #[arg(long)]
-        start_date: String,
+        start_date: Option<String>,
 
         /// Output plan to file
         #[arg(long)]
@@ -124,6 +143,33 @@ enum Commands {
         /// Output format: json, yaml
         #[arg(long, default_value = "json")]
         format: String,
+    },
+
+    /// Add one FOR VALUES IN (...) partition to a list-partitioned table.
+    ///
+    /// Run once per partition, as many times as needed. The target's
+    /// partitioning strategy is read from the live catalog, so this fails
+    /// clearly if pointed at a table that isn't list-partitioned.
+    AddPartition {
+        #[arg(long)]
+        schema: String,
+
+        /// The list-partitioned parent table
+        #[arg(long)]
+        table: String,
+
+        /// Name for the new child partition
+        #[arg(long)]
+        partition_name: String,
+
+        /// Comma-separated values this partition holds. Pass `NULL` for the
+        /// partition that catches null partition-key values
+        #[arg(long, value_delimiter = ',', required = true)]
+        values: Vec<String>,
+
+        /// Show the plan without executing it
+        #[arg(long)]
+        dry_run: bool,
     },
 
     /// Apply a partition migration plan
@@ -340,6 +386,8 @@ async fn main() -> Result<()> {
             table,
             strategy,
             key,
+            template_schema,
+            template_table,
             interval,
             premake,
             retention_type,
@@ -350,17 +398,51 @@ async fn main() -> Result<()> {
         }) => {
             let partition_strategy = PartitionStrategy::from_registration_str(&strategy)?;
             let retention_policy = build_retention_policy(retention_type, retention_value)?;
-            let parsed_start_date = parse_start_date(&start_date)?;
+
+            // `--interval`/`--premake`/`--start-date` describe a time-series
+            // window, which only the range cutover flow has. They're rejected
+            // rather than ignored in the template flow so a user who expects
+            // them to do something finds out immediately.
+            let template = template_table.map(|t| {
+                format!("{}.{}", template_schema.unwrap_or_else(|| schema.clone()), t)
+            });
+
+            let start_date = if template.is_some() {
+                for (flag, provided) in [
+                    ("--interval", interval.is_some()),
+                    ("--premake", premake.is_some()),
+                    ("--start-date", start_date.is_some()),
+                ] {
+                    if provided {
+                        return Err(anyhow::anyhow!(
+                            "{} does not apply when creating a table from a template",
+                            flag
+                        ));
+                    }
+                }
+                None
+            } else {
+                let start_date = start_date.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "--start-date is required when converting an existing table \
+                         (pass --template-table to create a new one instead)"
+                    )
+                })?;
+                Some(parse_start_date(&start_date)?.to_string())
+            };
 
             let config = MigrationConfig {
                 source_table: format!("{}.{}", schema, table),
                 partition_strategy,
                 partition_key: PartitionKey::new(key),
-                interval,
-                premake_count: premake,
+                interval: interval.unwrap_or_else(|| "1 month".to_string()),
+                premake_count: premake.unwrap_or(3),
                 use_bulk_copy: false,
                 retention_policy,
-                start_date: Some(parsed_start_date.to_string()),
+                start_date,
+                template_table: template,
+                list_partition_name: None,
+                list_partition_values: None,
             };
 
             let plan_obj = plan::Planner::plan_migration(&client, &schema, &table, &config).await?;
@@ -392,15 +474,60 @@ async fn main() -> Result<()> {
                     println!("  - {}: {}", action.action_type.to_string(), action.description);
                 }
             } else {
-                let applier = apply::Applier::new(None);
-                // Extract schema and table from the first action (simplified for Phase 1)
-                if let Some(first_action) = plan_obj.actions.first() {
-                    let parts: Vec<&str> = first_action.table_name.split('.').collect();
-                    if parts.len() == 2 {
+                // Extract schema and table from the first action (simplified for Phase 1).
+                // A plan can legitimately have no actions at all — that's how the
+                // template flow reports "the target already exists exactly as
+                // requested" — so say so rather than exiting silently.
+                match plan_obj.actions.first() {
+                    None => println!("Nothing to apply: this plan contains no actions"),
+                    Some(first_action) => {
+                        let parts: Vec<&str> = first_action.table_name.split('.').collect();
+                        if parts.len() != 2 {
+                            return Err(anyhow::anyhow!(
+                                "Plan action targets '{}'; expected a 'schema.table' name",
+                                first_action.table_name
+                            ));
+                        }
+                        let applier = apply::Applier::new(None);
                         applier.apply_plan(&client, parts[0], parts[1], &plan_obj).await?;
                         println!("Plan applied successfully");
                     }
                 }
+            }
+        }
+
+        Some(Commands::AddPartition {
+            schema,
+            table,
+            partition_name,
+            values,
+            dry_run,
+        }) => {
+            let plan_obj = plan::Planner::plan_add_list_partition(
+                &client,
+                &schema,
+                &table,
+                &partition_name,
+                &values,
+            )
+            .await?;
+
+            for warning in &plan_obj.warnings {
+                println!("Warning: {}", warning);
+            }
+
+            if dry_run {
+                println!("DRY RUN: Would apply {} action(s)", plan_obj.actions.len());
+                for action in &plan_obj.actions {
+                    println!("  - {}: {}", action.action_type.to_string(), action.description);
+                }
+            } else {
+                let applier = apply::Applier::new(None);
+                applier.apply_plan(&client, &schema, &table, &plan_obj).await?;
+                println!(
+                    "Created list partition {}.{} on {}.{}",
+                    schema, partition_name, schema, table
+                );
             }
         }
 

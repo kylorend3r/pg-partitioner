@@ -18,3 +18,7 @@ tests/fixtures/
 
 # Docs
 docs/
+
+# Generated plan files (`pg-partitioner plan --output`)
+plan.json
+*.plan.json

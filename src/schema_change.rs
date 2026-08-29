@@ -26,7 +26,7 @@ pub async fn plan_column_type_change(
         WHERE p.oid = {}::regclass
         ORDER BY c.relname
         "#,
-        queries::quote_ident(table_name)
+        queries::quote_regclass_literal(table_name)
     );
 
     let rows = client.query(&query, &[]).await?;
