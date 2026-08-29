@@ -333,3 +333,74 @@ pub struct RetryPolicy {
     pub backoff_max_ms: u32,
     pub jitter: bool,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn range_cutover_config() -> MigrationConfig {
+        MigrationConfig {
+            source_table: "public.events".to_string(),
+            partition_strategy: PartitionStrategy::Range,
+            partition_key: PartitionKey::single("created_at".to_string()),
+            interval: "1 month".to_string(),
+            premake_count: 3,
+            use_bulk_copy: false,
+            retention_policy: None,
+            start_date: Some("2026-01-01".to_string()),
+            template_table: None,
+            list_partition_name: None,
+            list_partition_values: None,
+        }
+    }
+
+    #[test]
+    fn test_as_sql_keyword() {
+        assert_eq!(PartitionStrategy::Range.as_sql_keyword(), "RANGE");
+        assert_eq!(PartitionStrategy::List.as_sql_keyword(), "LIST");
+        assert_eq!(PartitionStrategy::Hash.as_sql_keyword(), "HASH");
+    }
+
+    #[test]
+    fn test_from_partstrat_round_trip() {
+        // The catalog's single-letter codes, distinct from both the SQL
+        // keywords above and the registration strings.
+        for (code, expected) in [
+            ("r", PartitionStrategy::Range),
+            ("l", PartitionStrategy::List),
+            ("h", PartitionStrategy::Hash),
+        ] {
+            assert_eq!(PartitionStrategy::from_partstrat(code).unwrap(), expected);
+        }
+
+        // Postgres 17's `partstrat` gained no new codes, but an unknown one
+        // must be an error rather than silently defaulting to Range.
+        assert!(PartitionStrategy::from_partstrat("x").is_err());
+        assert!(PartitionStrategy::from_partstrat("").is_err());
+    }
+
+    #[test]
+    fn test_needs_range_boundaries_only_for_range_cutover() {
+        // The one shape that drives start_date/interval/premake.
+        assert!(range_cutover_config().needs_range_boundaries());
+
+        // Template creation has no period to compute, whatever the strategy.
+        let mut template = range_cutover_config();
+        template.template_table = Some("public.events_template".to_string());
+        assert!(!template.needs_range_boundaries());
+
+        // Nor does adding a single list partition.
+        let mut add_partition = range_cutover_config();
+        add_partition.partition_strategy = PartitionStrategy::List;
+        add_partition.list_partition_values = Some(vec!["eu-west".to_string()]);
+        assert!(!add_partition.needs_range_boundaries());
+
+        // A non-range cutover has no boundaries either — this is what stops the
+        // orchestrator demanding a start_date that means nothing to the plan.
+        for strategy in [PartitionStrategy::List, PartitionStrategy::Hash] {
+            let mut config = range_cutover_config();
+            config.partition_strategy = strategy;
+            assert!(!config.needs_range_boundaries());
+        }
+    }
+}

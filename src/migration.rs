@@ -824,6 +824,27 @@ mod tests {
     }
 
     #[test]
+    fn test_keys_equal_is_case_insensitive_and_order_sensitive() {
+        let region = PartitionKey::single("region".to_string());
+
+        // The catalog returns folded names; a user may have typed any case.
+        assert!(keys_equal(&region, &PartitionKey::single("REGION".to_string())));
+        assert!(keys_equal(&region, &region));
+
+        assert!(!keys_equal(&region, &PartitionKey::single("tenant_id".to_string())));
+
+        // A composite key's column *order* is part of its identity, so two keys
+        // over the same columns in a different order are not the same key.
+        let a = PartitionKey::new(vec!["tenant_id".to_string(), "created_at".to_string()]);
+        let b = PartitionKey::new(vec!["created_at".to_string(), "tenant_id".to_string()]);
+        assert!(!keys_equal(&a, &b));
+        assert!(keys_equal(&a, &a));
+
+        // Differing arity never matches.
+        assert!(!keys_equal(&region, &a));
+    }
+
+    #[test]
     fn test_format_list_values() {
         assert_eq!(
             format_list_values(&["eu-west".to_string(), "us-east".to_string()]),

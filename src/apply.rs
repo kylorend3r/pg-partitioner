@@ -125,6 +125,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_split_qualified_name() {
+        assert_eq!(
+            split_qualified_name("public.events").unwrap(),
+            ("public".to_string(), "events".to_string())
+        );
+
+        // A malformed `checksum_table` must fail loudly rather than silently
+        // drift-checking the wrong relation.
+        assert!(split_qualified_name("events").is_err());
+        assert!(split_qualified_name(".events").is_err());
+        assert!(split_qualified_name("public.").is_err());
+        assert!(split_qualified_name("").is_err());
+    }
+
+    #[test]
     fn test_applier_creation() {
         let applier = Applier::new(None);
         assert_eq!(

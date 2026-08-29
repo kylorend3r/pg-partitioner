@@ -18,15 +18,17 @@ Read this before developing a feature in this repository.
 
 ### Before you commit
 
-1. **Ask whether a full verification run is wanted**, and say what each option costs:
+1. **Add unit tests for what you built** — see §4.1. New logic that can be tested without a
+   database should ship with tests in the same change, not in a follow-up that never comes.
+2. **Ask whether a full verification run is wanted**, and say what each option costs:
    - *quick* — `cargo build && cargo test` (seconds)
-   - *full* — the above plus the live-database run in §4 (a minute or two, needs Docker)
+   - *full* — the above plus the live-database run in §4.2 (a minute or two, needs Docker)
 
    Don't assume. Ask, and wait for the answer.
-2. Update `CHANGELOG.md` — see §5.
-3. Update `README.md` and `docs/project-structure.md` if the change touched anything they
+3. Update `CHANGELOG.md` — see §5.
+4. Update `README.md` and `docs/project-structure.md` if the change touched anything they
    describe — see §6.
-4. Remove stray files the work generated (plan files, scratch SQL, temp scripts). Scratch work
+5. Remove stray files the work generated (plan files, scratch SQL, temp scripts). Scratch work
    belongs in the session scratchpad, never in the repo.
 
 ### Committing and pushing
@@ -153,8 +155,47 @@ constraints, a partition set with no children.
 
 ## 4. Testing
 
-`cargo test` covers pure logic only — parsing, name building, validation shape. It cannot catch
-anything above, because none of it fails until a real server sees it.
+Two layers, and neither substitutes for the other. Unit tests prove the logic you wrote is
+right; the live run proves it survives contact with a real server. Every rule in §3 exists
+because something passed the first and failed the second.
+
+### 4.1 Unit tests — write them as part of the feature
+
+**A new feature should leave the suite covering it.** Add tests in the same change, in the
+`#[cfg(test)] mod tests` at the bottom of the module you touched — that is the convention here,
+and there is no separate test crate for unit-level work.
+
+Test everything that doesn't need a connection. In practice that is more than it first appears:
+
+- **Parsers and formatters** — `parse_list_bound_values`, `format_list_values`. Cover the
+  round trip, the escaping, and at least one input that should be rejected.
+- **Name and DDL fragment builders** — `date_range_partition_name`, `quote_ident`,
+  `quote_regclass_literal`. These are pure string functions and have already shipped bugs.
+- **Predicates and comparisons** — `list_bound_matches`, `keys_equal`,
+  `needs_range_boundaries`. Cover both branches, not just the true one.
+- **Validation shape** — anything taking a `&MigrationConfig` and returning
+  `Vec<ValidationError>` without a client, such as `validate_strategy_key_shape`. Assert on the
+  `category`, not on message wording, so the test doesn't break when the prose is reworded.
+- **Enum conversions** — `as_sql_keyword`, `from_partstrat`, `as_registration_str`. A round-trip
+  test catches the variant somebody forgets to add later.
+
+Two habits worth keeping:
+
+- **When you fix a bug, add the test that would have caught it** — if it's reachable without a
+  database. Several bugs in §3 were pure-logic failures hiding behind a query.
+- **If a function can't be unit tested because it takes a `&Client`**, that's usually a hint the
+  decision inside it wants extracting into a pure function that *can* be. `classify_template_target`
+  keeps its catalog lookup thin for exactly this reason; the comparison it depends on
+  (`keys_equal`) is separately testable.
+
+Not everything is worth a test. Skip the ones that only restate an enum's definition or assert a
+constant equals itself. The bar is: would this catch a plausible mistake?
+
+### 4.2 Live verification — the layer that actually catches §3
+
+`cargo test` cannot catch anything in §3, because none of it fails until a real server sees it:
+a type mismatch, a NULL aggregate, a mis-scoped identifier — all compile, all pass unit tests,
+all fail at runtime.
 
 **The recurring failure mode in this codebase is code that looks finished and was never run.**
 Verify by running against a live database, not by reading.
