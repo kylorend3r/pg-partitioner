@@ -24,6 +24,7 @@ impl SetupWizard {
             template_table: None,
             list_partition_name: None,
             list_partition_values: None,
+            hash_modulus: None,
         };
 
         Ok(config)
@@ -48,6 +49,7 @@ mod tests {
             template_table: None,
             list_partition_name: None,
             list_partition_values: None,
+            hash_modulus: None,
         };
 
         assert_eq!(config.interval, "1 month");

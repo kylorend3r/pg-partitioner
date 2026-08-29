@@ -137,9 +137,15 @@ fn validate_identifier_lengths(
         });
     }
 
+    // Range only: this composes the table name with the *interval*, which is
+    // how range partition names used to be derived. For list and hash the
+    // interval is an inert default the CLI never asked for, so charging its
+    // length against the identifier budget rejects names that are perfectly
+    // legal for those strategies -- and does it before the checks that would
+    // have explained the real problem.
     let base_name = format!("{}_{}", table, interval);
 
-    if base_name.len() > IDENTIFIER_LIMIT {
+    if strategy == PartitionStrategy::Range && base_name.len() > IDENTIFIER_LIMIT {
         errors.push(ValidationError {
             category: "identifier_too_long".to_string(),
             message: format!(
@@ -173,8 +179,10 @@ fn validate_identifier_lengths(
     // dates involved, so this is a pure function of table.len() — no need to
     // compute real boundaries here. Only range partitioning derives names this
     // way: list children are named explicitly by the caller and hash buckets
-    // take a far shorter `_p{n}` suffix, so charging either of them 22 bytes
+    // take a much shorter `_p{n}` suffix, so charging either of them 22 bytes
     // of headroom would reject table names that are in fact perfectly legal.
+    // Hash's own suffix is bounded by its modulus and checked separately, by
+    // `validate_hash_partition_names`.
     const DATE_RANGE_SUFFIX_LEN: usize = 22;
     let worst_case_len = table.len() + DATE_RANGE_SUFFIX_LEN;
     if strategy == PartitionStrategy::Range && worst_case_len > IDENTIFIER_LIMIT {
@@ -190,6 +198,102 @@ fn validate_identifier_lengths(
     }
 
     errors
+}
+
+/// Types this tool accepts as a hash partition key, matching
+/// `information_schema.columns.data_type`'s spelling (not the `int2`/`int4`/
+/// `int8` internal aliases).
+///
+/// PostgreSQL itself is far more permissive — it hashes anything with a hash
+/// operator class, `text` and `date` included. This narrower list is a
+/// deliberate guardrail rather than a technical limit: hash partitioning
+/// distributes by `hash(key) % modulus`, so a key with few distinct values or
+/// a skewed distribution silently produces badly unbalanced buckets that only
+/// show up as a performance problem much later. Integer and UUID keys are the
+/// ones that reliably spread.
+const HASH_KEY_TYPES: [&str; 4] = ["smallint", "integer", "bigint", "uuid"];
+
+/// Checks that the widest hash bucket name still fits in an identifier.
+///
+/// Bucket names are `{table}_p{remainder}`, so the worst case is the largest
+/// remainder, `modulus - 1`. This matters more than the few bytes suggest:
+/// PostgreSQL **truncates** an over-long identifier silently rather than
+/// erroring, so `events_p409` and `events_p4095` can collapse onto the same
+/// name. The second `CREATE TABLE IF NOT EXISTS` then no-ops, the bucket set
+/// comes up one remainder short, and the failure surfaces much later as rows
+/// being rejected with no matching partition.
+fn validate_hash_partition_names(table: &str, modulus: usize) -> Vec<ValidationError> {
+    const IDENTIFIER_LIMIT: usize = 63;
+
+    let widest = format!("{}_p{}", table, modulus.saturating_sub(1));
+    if widest.len() <= IDENTIFIER_LIMIT {
+        return Vec::new();
+    }
+
+    vec![ValidationError {
+        category: "hash_partition_name_too_long".to_string(),
+        message: format!(
+            "Hash bucket names for '{}' at MODULUS {} would exceed PostgreSQL's 63-byte \
+             identifier limit (widest: '{}', {} bytes). PostgreSQL truncates silently, which \
+             would collapse two buckets onto one name and leave a remainder uncovered",
+            table,
+            modulus,
+            widest,
+            widest.len()
+        ),
+        suggestion: Some(format!(
+            "Use a table name of {} characters or fewer at this modulus, or reduce \
+             --hash-partitions",
+            IDENTIFIER_LIMIT - (widest.len() - table.len())
+        )),
+    }]
+}
+
+/// Checks that every hash partition-key column is one of `HASH_KEY_TYPES`.
+///
+/// Evaluated against the **template**, since the target inherits its column
+/// types verbatim through `LIKE`. This is the codebase's first column-*type*
+/// lookup; everything before it only ever asked whether a column existed.
+async fn validate_hash_key_types(
+    client: &Client,
+    schema: &str,
+    table: &str,
+    partition_key: &PartitionKey,
+) -> Result<Vec<ValidationError>> {
+    let mut errors = Vec::new();
+
+    let query = r#"
+        SELECT column_name, data_type
+        FROM information_schema.columns
+        WHERE table_schema = $1 AND table_name = $2 AND column_name = ANY($3)
+    "#;
+
+    let rows = client
+        .query(query, &[&schema, &table, &partition_key.columns])
+        .await?;
+
+    for row in rows {
+        let column_name: String = row.get(0);
+        let data_type: String = row.get(1);
+
+        if !HASH_KEY_TYPES.contains(&data_type.as_str()) {
+            errors.push(ValidationError {
+                category: "hash_key_type_unsupported".to_string(),
+                message: format!(
+                    "Hash partition key column '{}' is {}; hash partitioning here accepts {}",
+                    column_name,
+                    data_type,
+                    HASH_KEY_TYPES.join(", ")
+                ),
+                suggestion: Some(format!(
+                    "Use a {} column as the hash key, or partition BY RANGE or BY LIST instead",
+                    HASH_KEY_TYPES.join(" / ")
+                )),
+            });
+        }
+    }
+
+    Ok(errors)
 }
 
 async fn validate_unique_constraints(
@@ -289,6 +393,16 @@ pub async fn validate_template_creation(
     );
 
     errors.extend(validate_strategy_key_shape(config));
+
+    if config.partition_strategy == PartitionStrategy::Hash {
+        errors.extend(
+            validate_hash_key_types(client, template_schema, template_table, &config.partition_key)
+                .await?,
+        );
+        if let Some(modulus) = config.hash_modulus {
+            errors.extend(validate_hash_partition_names(target_table, modulus));
+        }
+    }
 
     errors.extend(validate_identifier_lengths(
         target_schema,
@@ -487,6 +601,7 @@ mod tests {
             template_table: None,
             list_partition_name: None,
             list_partition_values: None,
+            hash_modulus: None,
         }
     }
 
@@ -528,6 +643,27 @@ mod tests {
         let table = "a".repeat(45);
         let errors = validate_identifier_lengths("public", &table, &PartitionKey::single("region".to_string()), "2026_07", PartitionStrategy::List);
         assert!(!errors.iter().any(|e| e.category == "partition_name_too_long"));
+    }
+
+    #[test]
+    fn test_validate_hash_partition_names() {
+        // Ordinary names at ordinary moduli are fine.
+        assert!(validate_hash_partition_names("events", 8).is_empty());
+        assert!(validate_hash_partition_names("events", 4096).is_empty());
+
+        // 58 + "_p4095" = 64, one byte over — the case that would truncate.
+        let table = "a".repeat(58);
+        let errors = validate_hash_partition_names(&table, 4096);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].category, "hash_partition_name_too_long");
+
+        // The same name is fine at a modulus whose widest remainder is shorter.
+        assert!(validate_hash_partition_names(&table, 8).is_empty());
+
+        // Exactly at the limit is allowed: 60 + "_p7" = 63.
+        assert!(validate_hash_partition_names(&"a".repeat(60), 8).is_empty());
+        // And one past it is not: 60 + "_p15" = 64.
+        assert!(!validate_hash_partition_names(&"a".repeat(60), 16).is_empty());
     }
 
     #[test]

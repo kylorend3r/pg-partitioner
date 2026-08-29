@@ -123,6 +123,12 @@ enum Commands {
         #[arg(long)]
         premake: Option<usize>,
 
+        /// Hash only, and required there: how many buckets to create (the
+        /// MODULUS every child partition shares). Fixed at creation --
+        /// changing it later means recreating every bucket
+        #[arg(long)]
+        hash_partitions: Option<usize>,
+
         /// days | months | years | count — must be paired with --retention-value
         #[arg(long)]
         retention_type: Option<String>,
@@ -390,6 +396,7 @@ async fn main() -> Result<()> {
             template_table,
             interval,
             premake,
+            hash_partitions,
             retention_type,
             retention_value,
             start_date,
@@ -406,6 +413,34 @@ async fn main() -> Result<()> {
             let template = template_table.map(|t| {
                 format!("{}.{}", template_schema.unwrap_or_else(|| schema.clone()), t)
             });
+
+            // `--hash-partitions` is meaningful only where hash buckets are
+            // actually created, which today is the template flow alone.
+            if partition_strategy == PartitionStrategy::Hash {
+                if template.is_none() {
+                    return Err(anyhow::anyhow!(
+                        "--strategy hash requires --template-table: a hash-partitioned table \
+                         cannot have a DEFAULT partition, so there is no bucket that could hold \
+                         an existing table's rows and no way to convert one in place"
+                    ));
+                }
+                match hash_partitions {
+                    None => {
+                        return Err(anyhow::anyhow!(
+                            "--hash-partitions is required with --strategy hash (how many \
+                             buckets to create)"
+                        ))
+                    }
+                    Some(0) => {
+                        return Err(anyhow::anyhow!("--hash-partitions must be at least 1"))
+                    }
+                    Some(_) => {}
+                }
+            } else if hash_partitions.is_some() {
+                return Err(anyhow::anyhow!(
+                    "--hash-partitions applies only to --strategy hash"
+                ));
+            }
 
             let start_date = if template.is_some() {
                 for (flag, provided) in [
@@ -443,6 +478,7 @@ async fn main() -> Result<()> {
                 template_table: template,
                 list_partition_name: None,
                 list_partition_values: None,
+                hash_modulus: hash_partitions,
             };
 
             let plan_obj = plan::Planner::plan_migration(&client, &schema, &table, &config).await?;

@@ -240,6 +240,33 @@ impl Orchestrator {
                 // than quietly pooled somewhere they'd later have to be
                 // reconciled out of.
                 if let Some(config) = migration_config {
+                    // Hash: the whole bucket set at once. There is no DEFAULT
+                    // partition to fall back on, so a table missing even one
+                    // remainder rejects rows that hash to it.
+                    if config.partition_strategy == crate::types::PartitionStrategy::Hash {
+                        let modulus = config.hash_modulus.ok_or_else(|| {
+                            anyhow!(
+                                "hash partitioning requires hash_modulus; re-run `plan` with \
+                                 --hash-partitions"
+                            )
+                        })?;
+                        let created = migration::create_hash_partitions(
+                            client,
+                            schema,
+                            table,
+                            modulus,
+                            &self.retry_policy,
+                        )
+                        .await?;
+                        info!(
+                            table = action.table_name,
+                            modulus = modulus,
+                            created = created.len(),
+                            "Hash bucket set created"
+                        );
+                        return Ok(());
+                    }
+
                     if let Some(values) = config.list_partition_values.as_deref() {
                         let partition_name =
                             config.list_partition_name.as_deref().ok_or_else(|| {
@@ -283,30 +310,79 @@ impl Orchestrator {
             }
 
             ActionType::CreateIndex => {
-                let legacy_table = format!("{}_legacy", table);
-                let defs = index::get_indexes_for_table(client, schema, &legacy_table).await?;
+                // Where the index definitions come from depends on the flow.
+                // Cutover reads them off the renamed original (now the legacy
+                // child); template creation reads them off the template, which
+                // is the only place the target's structure has ever existed.
+                let (source_schema, source_table) = match migration_config
+                    .and_then(|c| c.template_table.as_deref())
+                {
+                    Some(template) => {
+                        let (ts, tt) = split_table_name(template)?;
+                        (ts.to_string(), tt.to_string())
+                    }
+                    None => (schema.to_string(), format!("{}_legacy", table)),
+                };
+
+                let partition_key_columns: &[String] = migration_config
+                    .map(|c| c.partition_key.columns.as_slice())
+                    .unwrap_or(&[]);
+
+                let defs = index::get_indexes_for_table(client, &source_schema, &source_table).await?;
 
                 for def in defs {
-                    if def.is_unique {
+                    // An expression index leaves no column names behind to
+                    // rebuild from — `get_indexes_for_table` returns a short
+                    // list for those rather than a wrong one.
+                    if def.columns.is_empty() {
                         warn!(
                             table = action.table_name,
                             index = def.name,
-                            legacy_table = legacy_table,
-                            "Skipping unique/PK index during automatic recreation: partitioned \
-                             tables require unique indexes to include all partition-key columns; \
-                             the original constraint remains enforced only on the legacy child"
+                            "Skipping index during automatic recreation: it is an expression \
+                             index, which cannot be reconstructed from column names alone"
                         );
                         continue;
                     }
 
-                    let new_index_name = format!("{}_new", def.name);
+                    // Postgres requires a unique index on a partitioned table
+                    // to include every partition-key column. One that does is
+                    // perfectly legal and worth keeping unique; one that
+                    // doesn't cannot be created at all.
+                    let unique_is_creatable = !def.is_unique
+                        || partition_key_columns.iter().all(|pk| {
+                            def.columns.iter().any(|c| c.eq_ignore_ascii_case(pk))
+                        });
+
+                    if !unique_is_creatable {
+                        warn!(
+                            table = action.table_name,
+                            index = def.name,
+                            source_table = source_table,
+                            "Skipping unique/PK index during automatic recreation: partitioned \
+                             tables require unique indexes to include all partition-key columns"
+                        );
+                        continue;
+                    }
+
+                    let new_index_name = derived_index_name(table, &def.name, &source_table);
+                    if new_index_name.len() > MAX_IDENTIFIER_BYTES {
+                        warn!(
+                            table = action.table_name,
+                            index = def.name,
+                            derived = new_index_name,
+                            "Skipping index during automatic recreation: the derived name would \
+                             exceed PostgreSQL's 63-byte identifier limit"
+                        );
+                        continue;
+                    }
+
                     index::create_index_on_parent(
                         client,
                         schema,
                         table,
                         &new_index_name,
                         &def.columns,
-                        false,
+                        def.is_unique,
                         false,
                         &self.retry_policy,
                     )
@@ -337,6 +413,25 @@ impl Orchestrator {
                 Ok(())
             }
         }
+    }
+}
+
+/// PostgreSQL's hard identifier limit. Names longer than this are silently
+/// truncated by the server, which turns two distinct indexes into a collision.
+const MAX_IDENTIFIER_BYTES: usize = 63;
+
+/// A name for the copy of `source_index` being created on `target_table`.
+///
+/// Index names are unique per schema, so the source's own name can't be
+/// reused — the source index still exists, on the legacy child or on the
+/// untouched template. Swapping the source table's name prefix for the
+/// target's keeps the recognisable `{table}_{cols}_idx` shape; anything that
+/// doesn't start with that prefix falls back to a suffix, which is the
+/// convention the cutover path already used.
+fn derived_index_name(target_table: &str, source_index: &str, source_table: &str) -> String {
+    match source_index.strip_prefix(source_table) {
+        Some(rest) => format!("{}{}", target_table, rest),
+        None => format!("{}_new", source_index),
     }
 }
 

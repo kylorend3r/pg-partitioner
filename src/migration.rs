@@ -394,6 +394,65 @@ pub async fn create_partitioned_table_from_template(
     .await
 }
 
+/// Name for hash bucket `remainder`: `{table}_p{r}`. Short by construction —
+/// even a 4096-bucket set adds only five bytes — which is why the identifier
+/// budget in `validation.rs` charges hash nothing like range's 22-byte
+/// date-range suffix.
+pub fn hash_partition_name(table: &str, remainder: usize) -> String {
+    format!("{}_p{}", table, remainder)
+}
+
+/// Creates the full set of hash buckets for `table` — one per remainder in
+/// `0..modulus`, all sharing that modulus.
+///
+/// The whole set is created at once because a hash-partitioned table is only
+/// complete when every remainder is covered: PostgreSQL rejects a row whose
+/// `hash(key) % modulus` lands on a missing bucket, and there is no DEFAULT
+/// partition to catch it (hash tables cannot have one). That is also why there
+/// is no incremental "add one bucket" operation to match list's
+/// `add-partition` — changing the modulus means recreating every bucket and
+/// redistributing every row.
+pub async fn create_hash_partitions(
+    client: &Client,
+    schema: &str,
+    table: &str,
+    modulus: usize,
+    retry_policy: &RetryPolicy,
+) -> Result<Vec<String>> {
+    if modulus == 0 {
+        return Err(anyhow::anyhow!(
+            "hash modulus must be at least 1 for {}.{}",
+            schema,
+            table
+        ));
+    }
+
+    let mut created = Vec::with_capacity(modulus);
+
+    for remainder in 0..modulus {
+        let partition_name = hash_partition_name(table, remainder);
+
+        // `IF NOT EXISTS`, like every other partition-creating statement here,
+        // so a retry after a failure partway through the set is safe.
+        let query = format!(
+            "CREATE TABLE IF NOT EXISTS {}.{} PARTITION OF {}.{}              FOR VALUES WITH (MODULUS {}, REMAINDER {})",
+            queries::quote_ident(schema),
+            queries::quote_ident(&partition_name),
+            queries::quote_ident(schema),
+            queries::quote_ident(table),
+            modulus,
+            remainder,
+        );
+
+        retry::execute_batch_with_retry(client, "create_hash_partition", &query, retry_policy)
+            .await?;
+
+        created.push(partition_name);
+    }
+
+    Ok(created)
+}
+
 /// Renders values for a `FOR VALUES IN (…)` bound. A value of `NULL` (in any
 /// case) is emitted as the SQL null keyword rather than the four-character
 /// string — that's the only way to declare the partition that catches null
@@ -821,6 +880,18 @@ mod tests {
             date_range_partition_name("products", "2026-07-22", "2026-07-23"),
             "products_2026_07_22_2026_07_23"
         );
+    }
+
+    #[test]
+    fn test_hash_partition_name() {
+        assert_eq!(hash_partition_name("events", 0), "events_p0");
+        assert_eq!(hash_partition_name("events", 15), "events_p15");
+
+        // The suffix is short but not free: at a large modulus it can push a
+        // long table name past the 63-byte identifier limit, which is why
+        // `validation::validate_hash_partition_names` exists.
+        assert_eq!(hash_partition_name(&"a".repeat(58), 4095).len(), 64);
+        assert_eq!(hash_partition_name(&"a".repeat(58), 7).len(), 61);
     }
 
     #[test]

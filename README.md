@@ -89,6 +89,12 @@ pg-partitioner apply --plan-file plan.json
 pg-partitioner add-partition --schema public --table events \
   --partition-name events_eu --values eu-west,eu-central
 
+# Or: create a hash-partitioned table with a fixed number of buckets
+pg-partitioner plan --schema public --table sessions \
+  --strategy hash --key tenant_id --template-table sessions_template \
+  --hash-partitions 8 --output plan.json
+pg-partitioner apply --plan-file plan.json
+
 # Automate ongoing premake + retention
 pg-partitioner maintain             # test manually first, then add to cron/systemd/k8s CronJob
 ```
@@ -219,10 +225,50 @@ Creation is idempotent the same way: if the target already exists as a list-part
 on the same key, `plan` emits a zero-action plan and says so; if it exists as anything else,
 it's a hard error naming the collision rather than a silent no-op.
 
-**Two things list partitioning does not do yet.** `maintain` skips list tables entirely —
-premake is a time-series idea and there's no "next" value set to derive, so new partitions are
-always an explicit `add-partition` call. And index recreation from the template isn't wired in;
-create indexes on the parent yourself once it has partitions.
+The template's indexes are recreated on the new parent, so partitions added later inherit them
+automatically. A unique index is carried over only if it includes the partition key — PostgreSQL
+requires that on a partitioned table — and one that doesn't is skipped with a warning rather than
+failing the run.
+
+**One thing list partitioning does not do.** `maintain` skips list tables entirely: premake is a
+time-series idea and there's no "next" value set to derive, so new partitions are always an
+explicit `add-partition` call.
+
+## How to create a hash-partitioned table
+
+Hash spreads rows evenly across a fixed number of buckets by `hash(key) % modulus`. It's for
+distributing write load or table size across partitions when there's no natural time or category
+to slice on — not for querying a subset, since a hash bucket has no meaning you can filter by.
+
+```bash
+pg-partitioner plan --schema public --table events \
+  --strategy hash --key tenant_id \
+  --template-table events_template \
+  --hash-partitions 8 \
+  --output plan.json
+pg-partitioner apply --plan-file plan.json
+```
+
+That creates the parent plus all 8 buckets (`events_p0` … `events_p7`) and recreates the
+template's indexes, in one plan.
+
+**Hash is template-only, and that's structural rather than a missing feature.** A hash-partitioned
+table cannot have a DEFAULT partition — every row is assigned to a bucket by
+`hash(key) % modulus`, so there is no bucket meaning "everything else". The cutover flow depends
+on exactly such a bucket to hold an existing table's rows, so there is no way to convert a
+populated table to hash. `--strategy hash` without `--template-table` fails and says so.
+
+**`--hash-partitions` is fixed at creation.** All buckets are created at once, because a hash
+table is only usable when every remainder is covered — a missing one rejects any row that hashes
+to it, with no default to catch it. There is no incremental `add-partition` for hash: changing
+the modulus means recreating every bucket and redistributing every row. Pick a modulus with room
+to grow.
+
+**The partition key must be `smallint`, `integer`, `bigint`, or `uuid`.** PostgreSQL is more
+permissive — it will hash `text` or `date` quite happily — but this is a deliberate guardrail.
+Hash distribution is only as good as the key's cardinality and spread, and a poorly-distributed
+key produces lopsided buckets that surface much later as a performance problem. Anything else is
+rejected at `plan` time with `hash_key_type_unsupported`.
 
 ## Commands
 
@@ -237,7 +283,8 @@ Setup
 
 Plan → apply
   plan           compute desired vs. current state, preflight-validate, write a checksummed plan
-                 (range: convert an existing table; list: create a new one from --template-table)
+                 (range: convert an existing table; list/hash: create a new one from
+                 --template-table)
   apply          re-checksum live schema against the plan (refuses on drift), execute
   add-partition  add one FOR VALUES IN (...) partition to a list-partitioned table
 
@@ -289,19 +336,22 @@ Working today, exercised end-to-end against a real PostgreSQL 16:
   with drift detection and auto-registration.
 - **List partitioning** — creating a parent from a template, plus `add-partition` for adding
   value sets one at a time.
+- **Hash partitioning** — creating a parent and its full bucket set from a template.
+- **Index recreation** — the template's indexes are rebuilt on a newly created parent, and a
+  converted table's are rebuilt on the new parent.
 - **Metadata and config** — `install`, `register`/`unregister`, and the `partitioner_logbook`
   audit trail every DDL action writes to.
 - **Premake maintenance** — `maintain` and the long-running `daemon`, for range tables.
 
 Not yet implemented, despite appearing in some older design notes:
 
-- **Hash partitioning.** `--strategy hash` parses but has no execution path. Hash tables can't
-  have a DEFAULT partition, so the cutover flow is structurally impossible for them; they'd have
-  to go through template creation, which currently accepts list only.
+- **Creating a range-partitioned table from a template.** Range still requires an existing table
+  to convert; `--template-table` accepts list and hash only.
 - **Retention enforcement.** `--retention-type`/`--retention-value` are stored but nothing drops
   a partition yet.
 - **Bulk-copy migration**, the fallback for tables that can't be attached as one range.
-- **Index recreation in the template flow**, and a DEFAULT partition for list tables.
+- **A DEFAULT partition for list tables** (hash cannot have one at all), and expression indexes,
+  which are skipped during recreation because they can't be rebuilt from column names.
 
 Treat anything in `docs/` claiming broader completeness as a design record rather than a
 description of the shipped tool — several of those files predate the code and describe commands

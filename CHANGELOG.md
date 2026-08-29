@@ -37,8 +37,37 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   with the same name and values is a no-op; the same name with *different* values is an error
   rather than a silent skip. Every call is recorded in `partitioner_logbook` like any other DDL.
 
+- **Hash partitioning.** Creates the parent and its full bucket set from a template in one plan:
+
+  ```
+  pg-partitioner plan --schema public --table events --strategy hash --key tenant_id \
+    --template-table events_template --hash-partitions 8 --output plan.json
+  ```
+
+  All buckets are created at once because a hash table is only usable when every remainder is
+  covered — a missing one rejects any row that hashes to it, and hash tables cannot have a
+  DEFAULT partition to catch it. That same restriction is why hash is template-only: the cutover
+  flow needs a default-like bucket to hold an existing table's rows, so a populated table cannot
+  be converted to hash at all. `--strategy hash` without `--template-table` fails and explains
+  why. There is no incremental `add-partition` for hash — changing the modulus means recreating
+  every bucket.
+
+- **Validation: hash partition keys must be `smallint`, `integer`, `bigint`, or `uuid`.**
+  PostgreSQL will hash `text` or `date` too, but a key with low cardinality or a skewed
+  distribution produces lopsided buckets that only surface as a performance problem much later.
+  Reported as `hash_key_type_unsupported`. This is the first column-*type* check in the tool;
+  everything before it only asked whether a column existed.
+
+- **Index recreation when creating a table from a template.** The template's indexes are rebuilt
+  on the new parent, so partitions added later inherit them. A unique index is carried over only
+  when it includes the partition key, as PostgreSQL requires; one that doesn't is skipped with a
+  warning. Expression indexes are skipped — they can't be rebuilt from column names alone.
+
 - **`plan --template-schema` / `--template-table`**, selecting template-based creation instead of
   cutover. `--template-schema` defaults to `--schema`.
+
+- **`plan --hash-partitions <N>`**, the bucket count for hash. Required with `--strategy hash`,
+  rejected otherwise, and must be at least 1.
 
 - **Validation: list partition keys must be a single column**, which is a PostgreSQL constraint
   rather than a limitation of this tool (`PARTITION BY LIST` accepts one column; RANGE and HASH
@@ -65,6 +94,25 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   claimed all roadmap phases were complete and pointed at a document describing removed commands.
 
 ### Fixed
+
+- **Recreated composite indexes could come out with their columns in the wrong order.**
+  `index::get_indexes_for_table` ordered index columns by `attnum` rather than by their position
+  in the index, so any index whose column order differed from the table's column order was
+  reported reversed — and rebuilt that way on the new parent. Index column order determines which
+  queries an index can serve, so this produced a valid index that answered different questions
+  than the original.
+
+- **A hash bucket set could come up a partition short on a long table name.** Bucket names are
+  `{table}_p{remainder}`, and PostgreSQL truncates an over-long identifier silently rather than
+  erroring — so at a high modulus two buckets could collapse onto one name, the second
+  `CREATE TABLE IF NOT EXISTS` would no-op, and the missing remainder would surface much later as
+  rows rejected with no matching partition. Now rejected at plan time as
+  `hash_partition_name_too_long`.
+
+- **The identifier-length budget charged list and hash tables for a range-only name.** `plan`
+  measured `{table}_{interval}` against the 63-byte limit for every strategy, but `--interval` is
+  an inert default for list and hash — so a legal table name could be rejected over a value the
+  user never supplied, before the checks that would have explained the real problem.
 
 - **`inspect` reported `Children: 0` for every partitioned table, always.** Three queries in
   `schema.rs` passed a schema-qualified name through `quote_ident`, producing

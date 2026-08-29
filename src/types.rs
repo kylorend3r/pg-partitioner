@@ -303,6 +303,12 @@ pub struct MigrationConfig {
     /// list partition instead of the range default+premake set.
     #[serde(default)]
     pub list_partition_values: Option<Vec<String>>,
+    /// Number of hash buckets to create — the `MODULUS` every child shares.
+    /// Distinct from `premake_count`, which counts forward *periods* and has no
+    /// hash meaning. Fixed at creation: changing it later means recreating
+    /// every bucket, so there is no incremental "add one" for hash.
+    #[serde(default)]
+    pub hash_modulus: Option<usize>,
 }
 
 impl MigrationConfig {
@@ -351,6 +357,7 @@ mod tests {
             template_table: None,
             list_partition_name: None,
             list_partition_values: None,
+            hash_modulus: None,
         }
     }
 
@@ -394,6 +401,13 @@ mod tests {
         add_partition.partition_strategy = PartitionStrategy::List;
         add_partition.list_partition_values = Some(vec!["eu-west".to_string()]);
         assert!(!add_partition.needs_range_boundaries());
+
+        // Hash creation, likewise.
+        let mut hash = range_cutover_config();
+        hash.partition_strategy = PartitionStrategy::Hash;
+        hash.template_table = Some("public.events_template".to_string());
+        hash.hash_modulus = Some(8);
+        assert!(!hash.needs_range_boundaries());
 
         // A non-range cutover has no boundaries either — this is what stops the
         // orchestrator demanding a start_date that means nothing to the plan.

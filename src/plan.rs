@@ -159,11 +159,16 @@ impl Planner {
 
     /// Plans creation of a new partitioned table from a template.
     ///
-    /// Currently list-only. Range and hash both reach this flow through the
-    /// same `--template-table` switch, but each needs its own child-creation
-    /// step (range: default + premake window; hash: the full modulus bucket
-    /// set, which has no default at all) that isn't built yet — so they're
-    /// rejected here rather than silently producing a parent with no children.
+    /// List and hash only. Range still reaches this flow through the same
+    /// `--template-table` switch but is rejected: it would need its own
+    /// default + premake-window child step, which isn't built here, and range
+    /// already has a complete path through cutover.
+    ///
+    /// The two supported strategies differ only in their middle step. List
+    /// creates no children at all — they arrive one at a time via
+    /// `add-partition`. Hash creates its entire bucket set immediately,
+    /// because a hash table is only usable once every remainder is covered and
+    /// it can have no DEFAULT partition to catch what's missing.
     async fn plan_template_creation(
         client: &Client,
         schema: &str,
@@ -176,12 +181,17 @@ impl Planner {
             .ok_or_else(|| anyhow::anyhow!("plan_template_creation called without a template"))?;
         let (template_schema, template_table) = split_qualified_name(template)?;
 
-        if config.partition_strategy != PartitionStrategy::List {
+        if config.partition_strategy == PartitionStrategy::Range {
             return Err(anyhow::anyhow!(
-                "Template-based creation currently supports --strategy list only (got {}). \
-                 Range tables are created by converting an existing table (omit --template-table); \
-                 hash support is not implemented yet.",
-                config.partition_strategy.as_registration_str()
+                "Template-based creation supports --strategy list and hash (got range). \
+                 Range tables are created by converting an existing table — omit \
+                 --template-table and pass --start-date."
+            ));
+        }
+
+        if config.partition_strategy == PartitionStrategy::Hash && config.hash_modulus.is_none() {
+            return Err(anyhow::anyhow!(
+                "migration_config missing hash_modulus; re-run `plan` with --hash-partitions"
             ));
         }
 
@@ -233,29 +243,61 @@ impl Planner {
                 ));
                 Vec::new()
             }
-            TemplateTargetState::Absent => vec![PlanAction {
-                id: Uuid::new_v4().to_string(),
-                action_type: ActionType::CreatePartitionSet,
-                table_name: table_name.clone(),
-                description: format!(
-                    "Create {} as PARTITION BY LIST ({}) from template {}",
-                    table_name,
-                    config.partition_key.columns.join(", "),
-                    template
-                ),
-                estimated_duration_secs: Some(1),
-            }],
+            TemplateTargetState::Absent => {
+                let mut actions = vec![PlanAction {
+                    id: Uuid::new_v4().to_string(),
+                    action_type: ActionType::CreatePartitionSet,
+                    table_name: table_name.clone(),
+                    description: format!(
+                        "Create {} as PARTITION BY {} ({}) from template {}",
+                        table_name,
+                        config.partition_strategy.as_sql_keyword(),
+                        config.partition_key.columns.join(", "),
+                        template
+                    ),
+                    estimated_duration_secs: Some(1),
+                }];
+
+                if config.partition_strategy == PartitionStrategy::Hash {
+                    let modulus = config.hash_modulus.unwrap_or_default();
+                    actions.push(PlanAction {
+                        id: Uuid::new_v4().to_string(),
+                        action_type: ActionType::CreatePartition,
+                        table_name: table_name.clone(),
+                        description: format!(
+                            "Create {} hash bucket(s) for {} (MODULUS {})",
+                            modulus, table_name, modulus
+                        ),
+                        estimated_duration_secs: Some(1),
+                    });
+                }
+
+                actions.push(PlanAction {
+                    id: Uuid::new_v4().to_string(),
+                    action_type: ActionType::CreateIndex,
+                    table_name: table_name.clone(),
+                    description: format!(
+                        "Recreate {}'s non-unique indexes on {}",
+                        template, table_name
+                    ),
+                    estimated_duration_secs: Some(1),
+                });
+
+                actions
+            }
         };
 
-        // No child partitions and no indexes are created here by design: the
-        // parent lands empty, and `add-partition` fills it in one child at a
-        // time. That keeps this a small, verifiable primitive — create the
-        // parent, confirm its strategy and key, done.
-        warnings.push(format!(
-            "no_partitions_created: {} will have no child partitions (not even a DEFAULT); \
-             add them with `pg-partitioner add-partition`",
-            table_name
-        ));
+        if config.partition_strategy == PartitionStrategy::List {
+            // List creates no children here by design: the parent lands empty
+            // and `add-partition` fills it in one value set at a time. An index
+            // created on the parent now still applies to every partition added
+            // later, so there's nothing to defer on that front.
+            warnings.push(format!(
+                "no_partitions_created: {} will have no child partitions (not even a DEFAULT); \
+                 add them with `pg-partitioner add-partition`",
+                table_name
+            ));
+        }
 
         // The target doesn't exist yet, so the checksum covers the template —
         // the structure the target is about to be copied from.
@@ -323,6 +365,7 @@ impl Planner {
             template_table: None,
             list_partition_name: Some(partition_name.to_string()),
             list_partition_values: Some(values.to_vec()),
+            hash_modulus: None,
         };
 
         let actions = vec![PlanAction {

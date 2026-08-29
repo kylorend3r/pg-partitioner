@@ -20,24 +20,39 @@ pub async fn get_indexes_for_table(
     schema: &str,
     table: &str,
 ) -> Result<Vec<IndexDef>> {
-    let query = format!(
-        r#"
-        SELECT i.relname, i.oid::int, array_agg(a.attname ORDER BY a.attnum),
+    // Columns are ordered by their position in `indkey`, not by `attnum`.
+    // Index column order is part of the index's identity — `(a, b)` and
+    // `(b, a)` serve different queries — so ordering by `attnum` silently
+    // reversed composite indexes whenever the columns happened to be declared
+    // in a different order than they were indexed, and anything recreating an
+    // index from this output built the wrong one.
+    //
+    // `attnum = 0` marks an expression index, which has no `pg_attribute` row
+    // to name; those drop out of the join, leaving `columns` shorter than the
+    // real index. Callers that recreate indexes must treat a short column list
+    // as "cannot reproduce this one" and skip it — `definition` still carries
+    // the full `pg_get_indexdef` text for anything that wants to inspect it.
+    let query = r#"
+        SELECT i.relname, i.oid::int,
+               COALESCE(
+                   (SELECT array_agg(a.attname ORDER BY k.ord)
+                    FROM unnest(ix.indkey) WITH ORDINALITY AS k(attnum, ord)
+                    JOIN pg_attribute a
+                        ON a.attrelid = ix.indrelid AND a.attnum = k.attnum
+                    WHERE k.attnum <> 0),
+                   ARRAY[]::name[]
+               ) AS columns,
                ix.indisunique, ix.indisprimary, pg_get_indexdef(i.oid)
         FROM pg_class t
         JOIN pg_namespace n ON n.oid = t.relnamespace
         JOIN pg_index ix ON ix.indrelid = t.oid
         JOIN pg_class i ON i.oid = ix.indexrelid
-        JOIN pg_attribute a ON a.attrelid = ix.indrelid
-            AND a.attnum = ANY(ix.indkey)
         WHERE n.nspname = $1 AND t.relname = $2
             AND i.relkind = 'i'
-        GROUP BY i.relname, i.oid, ix.indisunique, ix.indisprimary
         ORDER BY i.relname
-        "#
-    );
+    "#;
 
-    let rows = client.query(&query, &[&schema, &table]).await?;
+    let rows = client.query(query, &[&schema, &table]).await?;
 
     let mut indexes = Vec::new();
     for row in rows {
