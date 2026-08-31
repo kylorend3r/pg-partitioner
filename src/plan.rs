@@ -497,13 +497,27 @@ fn sequenced(mut actions: Vec<PlanAction>) -> Vec<PlanAction> {
     actions
 }
 
-/// Splits validation output into hard blockers and advisory warnings.
+/// Categories that describe something the operator should know about but that
+/// planning can proceed past. Everything else blocks.
 ///
-/// `unique_index_missing_partition_key` is the one category that doesn't block:
-/// the `CreateIndex` step already skips unique indexes that omit the partition
-/// key (PostgreSQL wouldn't accept them on a partitioned table), logging a
-/// warning rather than failing, so there's nothing left for planning to refuse
-/// over. Every other category still blocks.
+/// A `matches!` rather than a chain of string comparisons so that adding a
+/// category is a deliberate edit here, in one place, rather than an `||`
+/// appended at a call site (CLAUDE.md §2).
+fn is_advisory(category: &str) -> bool {
+    matches!(
+        category,
+        // The CreateIndex step already skips unique indexes that omit the
+        // partition key (PostgreSQL wouldn't accept them on a partitioned
+        // table), logging a warning rather than failing — so there is nothing
+        // left for planning to refuse over.
+        "unique_index_missing_partition_key"
+            // Template creation still produces a usable table; the identity
+            // column just arrives without its generator.
+            | "identity_column_not_copied"
+    )
+}
+
+/// Splits validation output into hard blockers and advisory warnings.
 fn split_blocking_errors(
     errors: Vec<crate::types::ValidationError>,
 ) -> (Vec<String>, Vec<String>) {
@@ -511,8 +525,16 @@ fn split_blocking_errors(
     let mut blocking = Vec::new();
 
     for error in errors {
-        let rendered = format!("{}: {}", error.category, error.message);
-        if error.category == "unique_index_missing_partition_key" {
+        // The suggestion is the actionable half and was being dropped on the
+        // floor here — every ValidationError carries one and none of them ever
+        // reached the operator, who is left with a diagnosis and no remedy.
+        let rendered = match &error.suggestion {
+            Some(suggestion) => {
+                format!("{}: {}. {}", error.category, error.message, suggestion)
+            }
+            None => format!("{}: {}", error.category, error.message),
+        };
+        if is_advisory(&error.category) {
             warnings.push(rendered);
         } else {
             blocking.push(rendered);
@@ -661,23 +683,50 @@ mod tests {
     }
 
     #[test]
-    fn test_split_blocking_errors_downgrades_unique_index_only() {
-        let errors = vec![
-            crate::types::ValidationError {
-                category: "unique_index_missing_partition_key".to_string(),
-                message: "pk omits region".to_string(),
-                suggestion: None,
-            },
-            crate::types::ValidationError {
-                category: "list_key_must_be_single_column".to_string(),
-                message: "two columns".to_string(),
-                suggestion: None,
-            },
-        ];
+    fn test_split_blocking_errors_downgrades_only_advisory_categories() {
+        let errors = [
+            "unique_index_missing_partition_key",
+            "identity_column_not_copied",
+            "list_key_must_be_single_column",
+            "identity_column_unsupported",
+        ]
+        .iter()
+        .map(|category| crate::types::ValidationError {
+            category: category.to_string(),
+            message: "detail".to_string(),
+            suggestion: None,
+        })
+        .collect();
 
         let (blocking, warnings) = split_blocking_errors(errors);
-        assert_eq!(warnings.len(), 1);
-        assert_eq!(blocking.len(), 1);
-        assert!(blocking[0].starts_with("list_key_must_be_single_column"));
+
+        assert_eq!(warnings.len(), 2, "{:?}", warnings);
+        assert_eq!(blocking.len(), 2, "{:?}", blocking);
+        // The cutover's identity finding must block; the template's must not —
+        // same root cause, different consequence.
+        assert!(blocking
+            .iter()
+            .any(|b| b.starts_with("identity_column_unsupported")));
+        assert!(warnings
+            .iter()
+            .any(|w| w.starts_with("identity_column_not_copied")));
+    }
+
+    #[test]
+    fn test_split_blocking_errors_keeps_the_suggestion() {
+        // A blocker that says what is wrong but not what to do about it is half
+        // a message; the suggestion has to survive rendering.
+        let errors = vec![crate::types::ValidationError {
+            category: "identity_column_unsupported".to_string(),
+            message: "public.events has identity column 'id'".to_string(),
+            suggestion: Some("Convert it to a plain sequence default first".to_string()),
+        }];
+
+        let (blocking, _) = split_blocking_errors(errors);
+        assert!(
+            blocking[0].contains("Convert it to a plain sequence default"),
+            "{:?}",
+            blocking
+        );
     }
 }
