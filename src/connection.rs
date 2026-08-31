@@ -54,7 +54,20 @@ pub async fn create_connection(config: &ConnectionConfig) -> Result<tokio_postgr
             let tls = MakeTlsConnector::new(tls);
             let (client, connection) = tokio_postgres::connect(&connection_string, tls)
                 .await
-                .map_err(|e| anyhow!("Failed to connect to database: {}", e))?;
+                .map_err(|e| match config.ssl_mode {
+                    // Worth spelling out: this path is stricter than libpq's.
+                    // native-tls validates the chain and the hostname, so
+                    // `require` here behaves like libpq's `verify-full` -- a
+                    // self-signed or internal-CA server certificate fails
+                    // where `psql "sslmode=require"` would have connected.
+                    SslMode::Require => anyhow!(
+                        "Failed to connect to database with sslmode=require: {}. Either the \
+                         server does not offer TLS (check `SHOW ssl`), or its certificate is \
+                         not trusted by this machine's certificate store.",
+                        e
+                    ),
+                    _ => anyhow!("Failed to connect to database: {}", e),
+                })?;
 
             tokio::spawn(async move {
                 if let Err(e) = connection.await {
@@ -106,9 +119,19 @@ fn build_connection_string(config: &ConnectionConfig) -> Result<String> {
         .map(|p| format!(":{}@", escape_password(p)))
         .unwrap_or_else(|| "@".to_string());
 
+    // `sslmode` must be in the string, not just implied by the connector we
+    // hand to `connect`. Without it tokio-postgres assumes `prefer`, so
+    // `--ssl-mode require` against a server with `ssl = off` would negotiate
+    // down to cleartext and send the password and every DDL statement in the
+    // open -- succeeding, which is the worst way to get this wrong.
     Ok(format!(
-        "postgresql://{}{}{}:{}/{}",
-        config.user, password_part, config.host, config.port, config.database
+        "postgresql://{}{}{}:{}/{}?sslmode={}",
+        config.user,
+        password_part,
+        config.host,
+        config.port,
+        config.database,
+        config.ssl_mode.as_libpq_str()
     ))
 }
 
@@ -126,6 +149,47 @@ mod tests {
     #[test]
     fn test_secret_string_zeroizes_on_drop() {
         let _secret = SecretString::new("sensitive data".to_string());
+    }
+
+    fn config(ssl_mode: SslMode) -> ConnectionConfig {
+        ConnectionConfig {
+            host: "db.example.com".to_string(),
+            port: 6432,
+            database: "app".to_string(),
+            user: "deploy".to_string(),
+            password: Some("pw".to_string()),
+            ssl_mode,
+        }
+    }
+
+    #[test]
+    fn test_connection_string_carries_ssl_mode() {
+        for (mode, expected) in [
+            (SslMode::Disable, "sslmode=disable"),
+            (SslMode::Prefer, "sslmode=prefer"),
+            (SslMode::Require, "sslmode=require"),
+        ] {
+            let s = build_connection_string(&config(mode)).expect("builds");
+            assert!(s.ends_with(expected), "{} lacks {}", s, expected);
+        }
+    }
+
+    #[test]
+    fn test_connection_string_shape() {
+        assert_eq!(
+            build_connection_string(&config(SslMode::Require)).expect("builds"),
+            "postgresql://deploy:pw@db.example.com:6432/app?sslmode=require"
+        );
+    }
+
+    #[test]
+    fn test_connection_string_without_password() {
+        let mut cfg = config(SslMode::Prefer);
+        cfg.password = None;
+        assert_eq!(
+            build_connection_string(&cfg).expect("builds"),
+            "postgresql://deploy@db.example.com:6432/app?sslmode=prefer"
+        );
     }
 
     #[test]

@@ -81,6 +81,12 @@ cat plan.json | jq '.'              # review the exact DDL and duration estimate
 pg-partitioner apply --plan-file plan.json --dry-run
 pg-partitioner apply --plan-file plan.json
 
+# Or: create a NEW range-partitioned table from a template instead of converting one
+pg-partitioner plan --schema public --table events \
+  --strategy range --key created_at --template-table events_template \
+  --interval "1 month" --premake 3 --output plan.json
+pg-partitioner apply --plan-file plan.json
+
 # Or: create a NEW list-partitioned table from a template, then fill it in
 pg-partitioner plan --schema public --table events \
   --strategy list --key region --template-table events_template \
@@ -99,7 +105,27 @@ pg-partitioner apply --plan-file plan.json
 pg-partitioner maintain             # test manually first, then add to cron/systemd/k8s CronJob
 ```
 
-`pg-partitioner <command> --help` is the authoritative flag reference; the walkthroughs below cover the two migrations the tool performs today.
+`pg-partitioner <command> --help` is the authoritative flag reference; the walkthroughs below cover the two migrations the tool performs.
+
+## The two migrations
+
+Everything this tool does to partition a table is one of two things, and which one you get is
+decided by a single flag, `--template-table`:
+
+| | **Existing-table strategy** (no `--template-table`) | **Template strategy** (`--template-table`) |
+|---|---|---|
+| What it does | Converts a table you already have, in place, ATTACH-first: the original becomes the first child of a new partitioned parent under the same name | Creates a *new* partitioned table whose columns are copied from a template table, which is only ever read |
+| Existing rows | Preserved — they end up in the `_legacy` partition | None; the new table starts empty |
+| Strategies | **Range only** | **Range, list, and hash** |
+| Needs | `--start-date`, ahead of every existing row | A template table |
+
+**Why the existing-table strategy is range-only, and will stay that way.** Converting a populated
+table means giving its rows somewhere to live in the new parent. Hash offers nowhere: a
+hash-partitioned table cannot have a DEFAULT partition, and every bucket's contents are fixed by
+`hash(key) % modulus`. List could technically attach the old table as its DEFAULT partition, but
+then no real `FOR VALUES IN (…)` partition could be created until every matching row had been
+moved out of it — PostgreSQL refuses to create a partition that overlaps rows sitting in DEFAULT.
+Both are rejected at plan time, pointing you at `--template-table`.
 
 ## How to partition an existing table (date/range partitioning)
 
@@ -163,13 +189,67 @@ pg-partitioner register --schema public --table events \
   --retention-type months --retention-value 12
 ```
 
-`maintain` now actually keeps registered tables' premake window topped up: each run recomputes "today's period through `--premake` periods ahead" and creates whatever's missing — including a partition you deleted by hand, not just extending the tail. Range tables only — list and hash registrations are skipped, since neither has a "next period" to premake. **Known gap:** retention enforcement (dropping partitions older than the registered policy) is still a placeholder — `maintain` won't drop anything yet.
+`maintain` keeps registered tables' premake window topped up: each run recomputes "today's period through `--premake` periods ahead" and creates whatever's missing — including a partition you deleted by hand, not just extending the tail. This works for range tables from either migration, converted or template-created.
+
+**Hash and list registrations are informational only.** `maintain` records and reports them but never creates anything for them, and they are excluded from its "tables processed" count rather than padding it:
+
+```
+Maintenance complete: 8 tables processed, 1 partitions created, 0 dropped
+Informational (not maintained, 13):
+  - public.sessions (hash): hash buckets are fixed at creation; adding one changes the modulus,
+    so every existing row would have to be rehashed and redistributed
+  - public.events (list): list partitions are added deliberately, one value set at a time, with
+    `pg-partitioner add-partition`
+```
+
+For hash this is structural, not a missing feature. A hash child's contents are decided by `hash(key) % modulus`, so adding a bucket changes the modulus and therefore changes which bucket **every row already stored** belongs to. That is not a partition creation, it is a full redistribution of the table — not something a scheduled sweep can do unattended. Register the table anyway: `register --hash-partitions <N>` records the bucket count, and `inspect` then reports `DriftMismatch` if a bucket ever goes missing, which otherwise surfaces only as rows being rejected with no matching partition.
+
+**Known gap:** retention enforcement (dropping partitions older than the registered policy) is still a placeholder — `maintain` won't drop anything yet.
+
+## How to create a new range-partitioned table from a template
+
+The section above converts a table you already have. When there is nothing to convert — a table
+you are about to create, or one you would rather build partitioned from the start — pass
+`--template-table` and range works the same way list and hash do:
+
+```bash
+# The template: an ordinary table, used only as a structure source.
+psql -c "CREATE TABLE events_template (
+           id bigserial, tenant_id int NOT NULL,
+           payload jsonb, created_at timestamptz NOT NULL DEFAULT now()
+         )"
+
+pg-partitioner plan --schema public --table events \
+  --strategy range --key created_at \
+  --template-table events_template \
+  --interval "1 month" --premake 3 \
+  --output plan.json
+pg-partitioner apply --plan-file plan.json
+```
+
+That creates `public.events` partitioned `BY RANGE (created_at)`, with today's period plus three
+ahead already in place, and registers it so `maintain` extends the window from the next sweep on.
+The template's non-unique indexes are rebuilt on the new parent, so partitions added later inherit
+them.
+
+**`--start-date` is optional here**, and defaults to today. In the cutover flow it is required
+because it is the boundary every existing row must predate; a table created from a template has no
+existing rows, so today's period is the sensible first partition. Pass it to backfill earlier
+periods — `--start-date 2026-01-01` creates every month from January through the premake window.
+It still may not be in the future.
+
+**It gets no DEFAULT partition**, and that is deliberate. A row that lands in a range table's
+DEFAULT partition stops PostgreSQL from ever creating the real partition covering that period —
+which is precisely what the next `maintain` sweep will try to do, so the sweep would start failing.
+An insert outside the premade window is rejected instead, which is the failure you can see. (The
+cutover flow does create one: it needs somewhere to put rows arriving beyond the window while the
+swap happens.)
 
 ## How to create a new list-partitioned table
 
-Range partitioning converts a table you already have. List partitioning works the other way
-round: you declare the value sets up front, so there's nothing to convert — the parent is
-created new, from a **template table** that supplies its columns.
+Range can be created either way. List works one way round only: you declare the value sets up
+front, so there's nothing to convert — the parent is created new, from a **template table** that
+supplies its columns.
 
 ```bash
 # 0. A template: an ordinary, existing table used only as a structure source.
@@ -264,11 +344,85 @@ to it, with no default to catch it. There is no incremental `add-partition` for 
 the modulus means recreating every bucket and redistributing every row. Pick a modulus with room
 to grow.
 
+**A hash table is therefore never maintained on a schedule**, only watched. `maintain` lists it
+under `Informational (not maintained)` and moves on — there is no "next partition" to create, and
+adding one would mean rehashing every row already stored. What registration buys you is detection:
+record the bucket count with `register --hash-partitions 8` (or let `apply` record it for you), and
+`inspect` reports a `DriftMismatch` if the live child count ever stops matching:
+
+```
+✗ public.events [DriftMismatch]: hash buckets: registered modulus=8 actual children=7
+```
+
+Worth watching for, because a hash table with a missing bucket has no DEFAULT partition to catch
+the rows that hash to it — they are simply rejected.
+
 **The partition key must be `smallint`, `integer`, `bigint`, or `uuid`.** PostgreSQL is more
 permissive — it will hash `text` or `date` quite happily — but this is a deliberate guardrail.
 Hash distribution is only as good as the key's cardinality and spread, and a poorly-distributed
 key produces lopsided buckets that surface much later as a performance problem. Anything else is
 rejected at `plan` time with `hash_key_type_unsupported`.
+
+## Partitioning one table from environment variables
+
+`scripts/partition_table.sh` runs the whole sequence — `install` → `plan` → `apply`, plus one
+`add-partition` per list child — with no flags to remember: everything is an environment
+variable, so the same invocation works from a laptop, a jump host, or a CI job against a remote
+database.
+
+```bash
+cargo build --release        # the script finds target/release/pg-partitioner on its own
+
+# Convert an existing time-series table to monthly range partitions
+PG_HOST=db.internal PG_PORT=5432 PG_DATABASE=app PG_USER=deploy PG_PASSWORD=… \
+PARTITION_TABLE=events PARTITION_STRATEGY=range PARTITION_KEY=created_at \
+PARTITION_START_DATE=2026-04-01 \
+./scripts/partition_table.sh
+
+# Create a hash-partitioned table with 4 buckets from a template
+PG_HOST=db.internal PG_DATABASE=app PG_USER=deploy PG_PASSWORD=… \
+PARTITION_TABLE=sessions PARTITION_STRATEGY=hash PARTITION_KEY=tenant_id \
+TEMPLATE_TABLE=sessions_template HASH_PARTITIONS=4 \
+./scripts/partition_table.sh
+
+# Create a NEW range-partitioned table from a template, rather than converting one
+PG_HOST=db.internal PG_DATABASE=app PG_USER=deploy PG_PASSWORD=… \
+PARTITION_TABLE=events PARTITION_STRATEGY=range PARTITION_KEY=created_at \
+TEMPLATE_TABLE=events_template PARTITION_PREMAKE=6 \
+./scripts/partition_table.sh
+
+# Create a list-partitioned table and its children in one go
+PG_HOST=db.internal PG_DATABASE=app PG_USER=deploy PG_PASSWORD=… \
+PARTITION_TABLE=events PARTITION_STRATEGY=list PARTITION_KEY=region \
+TEMPLATE_TABLE=events_template \
+LIST_PARTITIONS='events_eu=eu-west,eu-central;events_us=us-east;events_null=NULL' \
+./scripts/partition_table.sh
+```
+
+`PARTITION_HELP=1 ./scripts/partition_table.sh` prints every variable it reads. The ones worth
+knowing up front:
+
+| Variable | Meaning |
+|---|---|
+| `DRY_RUN=1` | plan and print the actions, execute no DDL |
+| `ASSUME_YES=1` | skip the confirmation prompt — **required** for non-interactive runs |
+| `SKIP_INSTALL=1` | don't run `install`; the metadata tables are already there |
+| `PLAN_FILE` | where to write the plan (default: a temp file, kept and printed) |
+| `PG_PARTITIONER_BIN` | which binary to run (default: `target/release`, then `target/debug`, then `$PATH`) |
+
+Two deliberate behaviours:
+
+- **`PG_HOST`, `PG_DATABASE`, and `PG_USER` are required by the script**, though the CLI itself
+  would default them to `localhost`/`postgres`/… . Against a remote database a typo that silently
+  targets localhost is worse than a refusal.
+- **A variable that doesn't apply to the chosen strategy is an error, not a no-op** —
+  `HASH_PARTITIONS` on a list run, `PARTITION_START_DATE` on a hash run. A run that appears to have
+  honoured a setting it ignored is how the wrong layout reaches production. `TEMPLATE_TABLE` is
+  required for list and hash and optional for range, where setting it switches from converting the
+  existing table to creating a new one.
+
+Without `ASSUME_YES=1` the script prints what it is about to do — server, target, strategy, key,
+template, bucket count — and waits for you to type `yes`.
 
 ## Commands
 
@@ -283,18 +437,22 @@ Setup
 
 Plan → apply
   plan           compute desired vs. current state, preflight-validate, write a checksummed plan
-                 (range: convert an existing table; list/hash: create a new one from
-                 --template-table)
+                 (with --template-table: create a new table, any strategy; without it: convert
+                 an existing table, range only)
   apply          re-checksum live schema against the plan (refuses on drift), execute
   add-partition  add one FOR VALUES IN (...) partition to a list-partitioned table
 
 Configuration
-  register       declare a table as managed (or update its strategy/interval/retention/premake)
+  register       declare a table as managed (or update its strategy/interval/retention/premake;
+                 --hash-partitions records a hash table's bucket count)
   unregister     stop managing a table's partitioning configuration
 
 Automation
-  maintain       premake future partitions + enforce retention across registered tables
+  maintain       premake future partitions + enforce retention across registered range tables
+                 (hash/list registrations are reported as informational, never modified)
 ```
+
+`--ssl-mode require` is enforced on the wire, not merely requested: it is written into the connection string, so a server with `ssl = off` fails the connection instead of quietly negotiating down to cleartext. It also validates the certificate chain and hostname, which makes it closer to libpq's `verify-full` than to libpq's `require` — an internal-CA or self-signed server certificate is rejected rather than accepted.
 
 Every subcommand supports `--host`/`--port`/`--database`/`--user`/`--password`/`--ssl-mode` (also settable via `PG_*` env vars or a TOML config file), `--log-level`, `--log-format` (`text`/`json`), and `--log-file`. Logging always writes to both the terminal and a log file — by default `$XDG_STATE_HOME/pg-partitioner/pg-partitioner.log` (or `~/.local/state/...` if that's unset), created automatically if missing.
 
@@ -304,7 +462,8 @@ Every subcommand supports `--host`/`--port`/`--database`/`--user`/`--password`/`
 src/            application source (see docs/project-structure.md for the module map)
 tests/          integration tests + tests/fixtures/, a numbered zero-to-hero fixture catalog
 docs/           design record — read docs/IMPLEMENTATION_GUIDE.md first
-scripts/        setup_test_env.sh / reset_test_env.sh for the disposable test container
+scripts/        partition_table.sh (env-var driven one-shot partitioning) +
+                setup_test_env.sh / reset_test_env.sh for the disposable test container
 CHANGELOG.md    what changed, per release
 ```
 
@@ -332,21 +491,24 @@ See `docs/test_environment.md` for the full fixture catalog and what each one ex
 Working today, exercised end-to-end against a real PostgreSQL 16:
 
 - **Read-only discovery** — `inspect`, `explain`, `export`, risk signals.
-- **Range partitioning of an existing table** — `plan` → `apply`, the full ATTACH-first cutover,
+- **The existing-table strategy, for range** — `plan` → `apply`, the full ATTACH-first cutover,
   with drift detection and auto-registration.
-- **List partitioning** — creating a parent from a template, plus `add-partition` for adding
-  value sets one at a time.
-- **Hash partitioning** — creating a parent and its full bucket set from a template.
+- **The template strategy, for all three** — range (the period window, no DEFAULT), list (an empty
+  parent, plus `add-partition` for adding value sets one at a time), and hash (the parent and its
+  full bucket set).
 - **Index recreation** — the template's indexes are rebuilt on a newly created parent, and a
   converted table's are rebuilt on the new parent.
 - **Metadata and config** — `install`, `register`/`unregister`, and the `partitioner_logbook`
   audit trail every DDL action writes to.
-- **Premake maintenance** — `maintain` and the long-running `daemon`, for range tables.
+- **One-shot partitioning from environment variables** — `scripts/partition_table.sh`, for
+  driving all three strategies against a remote database without flags.
+- **Premake maintenance** — `maintain` and the long-running `daemon`, for range tables from either
+  migration. Hash and list registrations are recorded and reported, never maintained.
 
 Not yet implemented, despite appearing in some older design notes:
 
-- **Creating a range-partitioned table from a template.** Range still requires an existing table
-  to convert; `--template-table` accepts list and hash only.
+- **Converting an existing table to list or hash.** Structural rather than missing — see
+  [The two migrations](#the-two-migrations). Both are rejected at plan time.
 - **Retention enforcement.** `--retention-type`/`--retention-value` are stored but nothing drops
   a partition yet.
 - **Bulk-copy migration**, the fallback for tables that can't be attached as one range.

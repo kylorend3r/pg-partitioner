@@ -7,7 +7,9 @@ use crate::index;
 use crate::migration;
 use crate::queries;
 use crate::save::{self, LogStatus};
-use crate::types::{ActionType, MigrationConfig, PlanAction, RetryPolicy};
+use crate::types::{
+    ActionType, MigrationConfig, PartitionCreationShape, PlanAction, RetryPolicy,
+};
 
 pub struct Orchestrator {
     pub retry_policy: RetryPolicy,
@@ -234,16 +236,29 @@ impl Orchestrator {
             }
 
             ActionType::CreatePartition => {
-                // `add-partition`: one explicitly-named list child, no default.
-                // A list-partitioned table gets no DEFAULT partition from this
-                // tool at all — rows with an unlisted value are rejected rather
-                // than quietly pooled somewhere they'd later have to be
-                // reconciled out of.
-                if let Some(config) = migration_config {
-                    // Hash: the whole bucket set at once. There is no DEFAULT
+                let config = migration_config.ok_or_else(|| {
+                    anyhow!(
+                        "CreatePartition requires migration_config; re-run `plan` to regenerate it"
+                    )
+                })?;
+
+                // Which children to build is derived from the config, not
+                // re-inferred here, so a new strategy fails to compile rather
+                // than falling through to whichever branch happened to be last.
+                let shape = config.creation_shape().ok_or_else(|| {
+                    anyhow!(
+                        "Plan carries a CreatePartition action for {}, but its config creates no \
+                         partitions of its own — a list table's children are added one at a time \
+                         with `add-partition`. Re-run `plan` to regenerate it.",
+                        action.table_name
+                    )
+                })?;
+
+                match shape {
+                    // The whole bucket set at once. There is no DEFAULT
                     // partition to fall back on, so a table missing even one
                     // remainder rejects rows that hash to it.
-                    if config.partition_strategy == crate::types::PartitionStrategy::Hash {
+                    PartitionCreationShape::HashBuckets => {
                         let modulus = config.hash_modulus.ok_or_else(|| {
                             anyhow!(
                                 "hash partitioning requires hash_modulus; re-run `plan` with \
@@ -264,10 +279,21 @@ impl Orchestrator {
                             created = created.len(),
                             "Hash bucket set created"
                         );
-                        return Ok(());
+                        Ok(())
                     }
 
-                    if let Some(values) = config.list_partition_values.as_deref() {
+                    // `add-partition`: one explicitly-named list child, no
+                    // default. A list-partitioned table gets no DEFAULT
+                    // partition from this tool at all — rows with an unlisted
+                    // value are rejected rather than quietly pooled somewhere
+                    // they'd later have to be reconciled out of.
+                    PartitionCreationShape::SingleListPartition => {
+                        let values = config.list_partition_values.as_deref().ok_or_else(|| {
+                            anyhow!(
+                                "migration_config has no list_partition_values; re-run `plan` \
+                                 to regenerate it"
+                            )
+                        })?;
                         let partition_name =
                             config.list_partition_name.as_deref().ok_or_else(|| {
                                 anyhow!(
@@ -275,7 +301,7 @@ impl Orchestrator {
                                      list_partition_name; re-run `plan` to regenerate it"
                                 )
                             })?;
-                        return migration::create_list_partition(
+                        migration::create_list_partition(
                             client,
                             schema,
                             table,
@@ -283,30 +309,50 @@ impl Orchestrator {
                             values,
                             &self.retry_policy,
                         )
-                        .await;
+                        .await
+                    }
+
+                    PartitionCreationShape::RangeWindow { with_default } => {
+                        // Cutover only. A table created from a template starts
+                        // empty, and a row that later lands in DEFAULT would
+                        // block creating that period's real partition — which
+                        // is exactly what the next maintenance sweep tries to
+                        // do, so it would start failing.
+                        if with_default {
+                            migration::create_default_partition(
+                                client,
+                                schema,
+                                table,
+                                &self.retry_policy,
+                            )
+                            .await?;
+                        }
+
+                        let boundaries = boundaries.ok_or_else(|| {
+                            anyhow!(
+                                "CreatePartition for a range table requires computed partition \
+                                 boundaries; re-run `plan` to regenerate it"
+                            )
+                        })?;
+
+                        for pair in boundaries.windows(2) {
+                            let partition_name =
+                                migration::date_range_partition_name(table, &pair[0], &pair[1]);
+                            migration::create_range_partition(
+                                client,
+                                schema,
+                                table,
+                                &partition_name,
+                                &pair[0],
+                                &pair[1],
+                                &self.retry_policy,
+                            )
+                            .await?;
+                        }
+
+                        Ok(())
                     }
                 }
-
-                migration::create_default_partition(client, schema, table, &self.retry_policy).await?;
-
-                if let Some(boundaries) = boundaries {
-                    for pair in boundaries.windows(2) {
-                        let partition_name =
-                            migration::date_range_partition_name(table, &pair[0], &pair[1]);
-                        migration::create_range_partition(
-                            client,
-                            schema,
-                            table,
-                            &partition_name,
-                            &pair[0],
-                            &pair[1],
-                            &self.retry_policy,
-                        )
-                        .await?;
-                    }
-                }
-
-                Ok(())
             }
 
             ActionType::CreateIndex => {

@@ -30,6 +30,12 @@ pub async fn create_registrations_table(client: &Client) -> Result<()> {
             registered_at VARCHAR(64) NOT NULL,
             PRIMARY KEY (schema_name, table_name)
         );
+        -- Separate from the CREATE above on purpose: `CREATE TABLE IF NOT
+        -- EXISTS` does nothing at all when the table is already there, so an
+        -- install that predates this column would never gain it. Both
+        -- statements are idempotent, which is what lets `install` be re-run.
+        ALTER TABLE partitioner.partitioner_registrations
+            ADD COLUMN IF NOT EXISTS hash_modulus INTEGER;
     "#;
 
     client.batch_execute(query).await?;
@@ -45,16 +51,26 @@ pub async fn upsert_registration(client: &Client, registration: &PartitionRegist
         .map(serde_json::to_string)
         .transpose()?;
 
+    let hash_modulus = registration
+        .hash_modulus
+        .map(|m| {
+            i32::try_from(m).map_err(|_| {
+                anyhow::anyhow!("hash modulus {} does not fit in an INTEGER column", m)
+            })
+        })
+        .transpose()?;
+
     let query = r#"
         INSERT INTO partitioner.partitioner_registrations
-            (id, schema_name, table_name, strategy, partition_key, interval, premake_count, retention_policy, registered_at)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            (id, schema_name, table_name, strategy, partition_key, interval, premake_count, retention_policy, hash_modulus, registered_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
         ON CONFLICT (schema_name, table_name) DO UPDATE SET
             strategy = EXCLUDED.strategy,
             partition_key = EXCLUDED.partition_key,
             interval = EXCLUDED.interval,
             premake_count = EXCLUDED.premake_count,
             retention_policy = EXCLUDED.retention_policy,
+            hash_modulus = EXCLUDED.hash_modulus,
             registered_at = EXCLUDED.registered_at
     "#;
 
@@ -70,6 +86,7 @@ pub async fn upsert_registration(client: &Client, registration: &PartitionRegist
                 &registration.interval,
                 &(registration.premake_count as i32),
                 &retention_policy_json,
+                &hash_modulus,
                 &registration.registered_at,
             ],
         )
@@ -88,7 +105,7 @@ pub async fn get_registration(
     }
 
     let query = r#"
-        SELECT id, schema_name, table_name, strategy, partition_key, interval, premake_count, retention_policy, registered_at
+        SELECT id, schema_name, table_name, strategy, partition_key, interval, premake_count, retention_policy, hash_modulus, registered_at
         FROM partitioner.partitioner_registrations
         WHERE schema_name = $1 AND table_name = $2
     "#;
@@ -106,7 +123,7 @@ pub async fn list_registrations(client: &Client) -> Result<Vec<PartitionRegistra
     }
 
     let query = r#"
-        SELECT id, schema_name, table_name, strategy, partition_key, interval, premake_count, retention_policy, registered_at
+        SELECT id, schema_name, table_name, strategy, partition_key, interval, premake_count, retention_policy, hash_modulus, registered_at
         FROM partitioner.partitioner_registrations
         ORDER BY schema_name, table_name
     "#;
@@ -130,6 +147,7 @@ fn row_to_registration(row: &tokio_postgres::Row) -> Result<PartitionRegistratio
     let partition_key_str: String = row.get(4);
     let premake_count: i32 = row.get(6);
     let retention_policy_json: Option<String> = row.get(7);
+    let hash_modulus: Option<i32> = row.get(8);
 
     let retention_policy = retention_policy_json
         .map(|json| serde_json::from_str::<RetentionPolicy>(&json))
@@ -149,10 +167,19 @@ fn row_to_registration(row: &tokio_postgres::Row) -> Result<PartitionRegistratio
         interval: row.get(5),
         premake_count: premake_count as usize,
         retention_policy,
-        registered_at: row.get(8),
+        hash_modulus: hash_modulus.map(|m| m as usize),
+        registered_at: row.get(9),
     })
 }
 
+/// `hash_modulus` is accepted for every strategy but only meaningful for hash;
+/// callers pass the `MigrationConfig`'s value through, which is `None` for
+/// range and list by construction.
+///
+/// One positional argument per stored column, matching the DDL helpers in
+/// `migration.rs`; a params struct for a function with two callers would be
+/// more indirection than it removes.
+#[allow(clippy::too_many_arguments)]
 pub fn new_registration(
     schema_name: String,
     table_name: String,
@@ -161,6 +188,7 @@ pub fn new_registration(
     interval: String,
     premake_count: usize,
     retention_policy: Option<RetentionPolicy>,
+    hash_modulus: Option<usize>,
 ) -> PartitionRegistration {
     PartitionRegistration {
         id: Uuid::new_v4().to_string(),
@@ -171,6 +199,13 @@ pub fn new_registration(
         interval,
         premake_count,
         retention_policy,
+        hash_modulus: match strategy {
+            PartitionStrategy::Hash => hash_modulus,
+            // Recorded as absent rather than carried along: a modulus on a
+            // range or list row would be read back as a real bucket count by
+            // anything reconciling against the live catalog.
+            PartitionStrategy::Range | PartitionStrategy::List => None,
+        },
         registered_at: Utc::now().to_rfc3339(),
     }
 }
@@ -207,11 +242,43 @@ mod tests {
             "1 month".to_string(),
             3,
             None,
+            None,
         );
 
         assert!(Uuid::parse_str(&registration.id).is_ok());
         assert!(chrono::DateTime::parse_from_rfc3339(&registration.registered_at).is_ok());
         assert_eq!(registration.schema_name, "public");
         assert_eq!(registration.premake_count, 3);
+    }
+
+    #[test]
+    fn test_new_registration_keeps_hash_modulus_for_hash_only() {
+        let hash = new_registration(
+            "public".to_string(),
+            "events".to_string(),
+            PartitionStrategy::Hash,
+            PartitionKey::single("tenant_id".to_string()),
+            "1 month".to_string(),
+            0,
+            None,
+            Some(8),
+        );
+        assert_eq!(hash.hash_modulus, Some(8));
+
+        // A modulus that reached a range or list registration would be read
+        // back by reconciliation as a live bucket count.
+        for strategy in [PartitionStrategy::Range, PartitionStrategy::List] {
+            let other = new_registration(
+                "public".to_string(),
+                "events".to_string(),
+                strategy,
+                PartitionKey::single("created_at".to_string()),
+                "1 month".to_string(),
+                3,
+                None,
+                Some(8),
+            );
+            assert_eq!(other.hash_modulus, None);
+        }
     }
 }

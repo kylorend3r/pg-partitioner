@@ -216,7 +216,11 @@ enum Commands {
         format: String,
     },
 
-    /// Declare a table as managed by pg-partitioner (or update its config)
+    /// Declare a table as managed by pg-partitioner (or update its config).
+    ///
+    /// A hash registration is informational only: `maintain` never touches it,
+    /// because adding a bucket changes the modulus and so requires rehashing
+    /// and redistributing every existing row.
     Register {
         #[arg(long)]
         schema: String,
@@ -237,6 +241,11 @@ enum Commands {
 
         #[arg(long, default_value_t = 3)]
         premake: usize,
+
+        /// Hash only: the table's bucket count (MODULUS), recorded so that
+        /// `inspect` can tell a hand-dropped bucket from a healthy set
+        #[arg(long)]
+        hash_partitions: Option<usize>,
 
         /// days | months | years | count — must be paired with --retention-value
         #[arg(long)]
@@ -442,28 +451,46 @@ async fn main() -> Result<()> {
                 ));
             }
 
-            let start_date = if template.is_some() {
-                for (flag, provided) in [
-                    ("--interval", interval.is_some()),
-                    ("--premake", premake.is_some()),
-                    ("--start-date", start_date.is_some()),
-                ] {
-                    if provided {
-                        return Err(anyhow::anyhow!(
-                            "{} does not apply when creating a table from a template",
-                            flag
-                        ));
-                    }
+            let start_date = match (template.is_some(), partition_strategy) {
+                // Template + range: the same time-series window as cutover,
+                // just starting from an empty table instead of behind a legacy
+                // partition. `--start-date` is optional here precisely because
+                // there is no existing data it has to sit ahead of — today's
+                // period is the sensible first partition.
+                (true, PartitionStrategy::Range) => {
+                    let start_date = start_date
+                        .unwrap_or_else(|| chrono::Utc::now().date_naive().to_string());
+                    Some(parse_start_date(&start_date)?.to_string())
                 }
-                None
-            } else {
-                let start_date = start_date.ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "--start-date is required when converting an existing table \
-                         (pass --template-table to create a new one instead)"
-                    )
-                })?;
-                Some(parse_start_date(&start_date)?.to_string())
+                // Neither list nor hash has a period window, so these are
+                // rejected rather than ignored: a run that looks like it
+                // honoured a flag it dropped is worse than one that fails.
+                (true, PartitionStrategy::List | PartitionStrategy::Hash) => {
+                    for (flag, provided) in [
+                        ("--interval", interval.is_some()),
+                        ("--premake", premake.is_some()),
+                        ("--start-date", start_date.is_some()),
+                    ] {
+                        if provided {
+                            return Err(anyhow::anyhow!(
+                                "{} does not apply when creating a {} table from a template \
+                                 (it describes a time window, which only range has)",
+                                flag,
+                                partition_strategy.as_registration_str()
+                            ));
+                        }
+                    }
+                    None
+                }
+                (false, _) => {
+                    let start_date = start_date.ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "--start-date is required when converting an existing table \
+                             (pass --template-table to create a new one instead)"
+                        )
+                    })?;
+                    Some(parse_start_date(&start_date)?.to_string())
+                }
             };
 
             let config = MigrationConfig {
@@ -578,6 +605,15 @@ async fn main() -> Result<()> {
                     summary.created_partitions.len(),
                     summary.dropped_partitions.len()
                 );
+                if !summary.informational_tables.is_empty() {
+                    println!(
+                        "Informational (not maintained, {}):",
+                        summary.informational_tables.len()
+                    );
+                    for entry in &summary.informational_tables {
+                        println!("  - {}", entry);
+                    }
+                }
                 if !summary.created_partitions.is_empty() {
                     println!("Created:");
                     for partition in &summary.created_partitions {
@@ -638,6 +674,7 @@ async fn main() -> Result<()> {
             key,
             interval,
             premake,
+            hash_partitions,
             retention_type,
             retention_value,
         }) => {
@@ -645,6 +682,15 @@ async fn main() -> Result<()> {
 
             let strategy = PartitionStrategy::from_registration_str(&strategy)?;
             let retention_policy = build_retention_policy(retention_type, retention_value)?;
+
+            // Same rule as `plan`: rejected rather than silently dropped, so a
+            // modulus recorded against a range table can't later be read back
+            // as a bucket count.
+            if strategy != PartitionStrategy::Hash && hash_partitions.is_some() {
+                return Err(anyhow::anyhow!(
+                    "--hash-partitions applies only to --strategy hash"
+                ));
+            }
 
             let registration = registrations::new_registration(
                 schema,
@@ -654,12 +700,24 @@ async fn main() -> Result<()> {
                 interval,
                 premake,
                 retention_policy,
+                hash_partitions,
             );
             registrations::upsert_registration(&client, &registration).await?;
             println!(
                 "Registered {}.{}",
                 registration.schema_name, registration.table_name
             );
+
+            if let maintain::MaintenanceEligibility::Informational { reason } =
+                maintain::maintenance_eligibility(strategy)
+            {
+                println!(
+                    "Note: {} registrations are informational — `maintain` will not create \
+                     partitions for this table. {}",
+                    strategy.as_registration_str(),
+                    reason
+                );
+            }
         }
 
         Some(Commands::Unregister { schema, table }) => {

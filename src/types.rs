@@ -162,11 +162,28 @@ pub struct ConnectionConfig {
     pub ssl_mode: SslMode,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SslMode {
     Disable,
     Prefer,
     Require,
+}
+
+impl SslMode {
+    /// The libpq `sslmode` keyword, for the connection string.
+    ///
+    /// This has to reach the connection string: picking a TLS connector only
+    /// says *how* to negotiate, not whether an unencrypted connection is
+    /// acceptable. tokio-postgres defaults to `prefer` when the string is
+    /// silent, so a `Require` that never gets written down happily falls back
+    /// to cleartext against a server with `ssl = off`.
+    pub fn as_libpq_str(&self) -> &'static str {
+        match self {
+            SslMode::Disable => "disable",
+            SslMode::Prefer => "prefer",
+            SslMode::Require => "require",
+        }
+    }
 }
 
 impl ConnectionConfig {
@@ -254,6 +271,11 @@ pub struct PartitionRegistration {
     pub interval: String,
     pub premake_count: usize,
     pub retention_policy: Option<RetentionPolicy>,
+    /// Bucket count for a hash registration, `None` for every other strategy —
+    /// and also for a hash row written before this column existed, which is why
+    /// reconciliation has to read it as "unknown" rather than "no buckets".
+    #[serde(default)]
+    pub hash_modulus: Option<usize>,
     pub registered_at: String,
 }
 
@@ -311,15 +333,55 @@ pub struct MigrationConfig {
     pub hash_modulus: Option<usize>,
 }
 
+/// What a plan's `CreatePartition` action is supposed to build.
+///
+/// Derived from the config rather than branched on at the call site, so adding
+/// a strategy is a compile error in the orchestrator's `match` instead of a
+/// silent fallthrough into whichever arm happened to be last.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PartitionCreationShape {
+    /// Every hash bucket at once. A hash table is only usable when all of them
+    /// exist — there is no DEFAULT to catch a missing remainder.
+    HashBuckets,
+    /// One `FOR VALUES IN (…)` child, from `add-partition`.
+    SingleListPartition,
+    /// The date-window set computed from `start_date`/`interval`/premake.
+    ///
+    /// `with_default` is true only for cutover, which needs somewhere to put
+    /// rows outside the premade window while the swap happens. A table created
+    /// from a template starts empty and gets none: a row that lands in DEFAULT
+    /// blocks creating that period's real partition later, which would make the
+    /// next maintenance sweep fail.
+    RangeWindow { with_default: bool },
+}
+
 impl MigrationConfig {
     /// True when this config drives the range-shaped boundary machinery
-    /// (`start_date` + `interval` + premake). False for both new flows —
-    /// template creation and single-list-partition adds — neither of which
-    /// has a period boundary to compute.
+    /// (`start_date` + `interval` + premake) — both range flows, cutover and
+    /// template creation. False for list and hash, neither of which has a
+    /// period boundary to compute, and for single-list-partition adds.
     pub fn needs_range_boundaries(&self) -> bool {
-        self.partition_strategy == PartitionStrategy::Range
-            && self.template_table.is_none()
-            && self.list_partition_values.is_none()
+        self.partition_strategy == PartitionStrategy::Range && self.list_partition_values.is_none()
+    }
+
+    /// What a `CreatePartition` action against this config should create.
+    ///
+    /// `None` means this config never creates partitions that way — the list
+    /// template flow, whose children arrive later via `add-partition`. A plan
+    /// that pairs such a config with a `CreatePartition` action is malformed,
+    /// so the caller should error rather than guess.
+    pub fn creation_shape(&self) -> Option<PartitionCreationShape> {
+        if self.list_partition_values.is_some() {
+            return Some(PartitionCreationShape::SingleListPartition);
+        }
+
+        match self.partition_strategy {
+            PartitionStrategy::Hash => Some(PartitionCreationShape::HashBuckets),
+            PartitionStrategy::Range => Some(PartitionCreationShape::RangeWindow {
+                with_default: self.template_table.is_none(),
+            }),
+            PartitionStrategy::List => None,
+        }
     }
 }
 
@@ -386,35 +448,101 @@ mod tests {
         assert!(PartitionStrategy::from_partstrat("").is_err());
     }
 
+    fn range_template_config() -> MigrationConfig {
+        let mut config = range_cutover_config();
+        config.template_table = Some("public.events_template".to_string());
+        config
+    }
+
+    fn list_template_config() -> MigrationConfig {
+        let mut config = range_template_config();
+        config.partition_strategy = PartitionStrategy::List;
+        config.partition_key = PartitionKey::single("region".to_string());
+        config.start_date = None;
+        config
+    }
+
+    fn hash_template_config() -> MigrationConfig {
+        let mut config = range_template_config();
+        config.partition_strategy = PartitionStrategy::Hash;
+        config.hash_modulus = Some(8);
+        config.start_date = None;
+        config
+    }
+
+    fn add_list_partition_config() -> MigrationConfig {
+        let mut config = range_cutover_config();
+        config.partition_strategy = PartitionStrategy::List;
+        config.list_partition_values = Some(vec!["eu-west".to_string()]);
+        config
+    }
+
     #[test]
-    fn test_needs_range_boundaries_only_for_range_cutover() {
-        // The one shape that drives start_date/interval/premake.
+    fn test_needs_range_boundaries_for_both_range_flows() {
+        // Both range flows compute the same period window: cutover starts it
+        // after the legacy partition, template creation starts it at an empty
+        // table. Neither can be planned without boundaries.
         assert!(range_cutover_config().needs_range_boundaries());
+        assert!(range_template_config().needs_range_boundaries());
 
-        // Template creation has no period to compute, whatever the strategy.
-        let mut template = range_cutover_config();
-        template.template_table = Some("public.events_template".to_string());
-        assert!(!template.needs_range_boundaries());
-
-        // Nor does adding a single list partition.
-        let mut add_partition = range_cutover_config();
-        add_partition.partition_strategy = PartitionStrategy::List;
-        add_partition.list_partition_values = Some(vec!["eu-west".to_string()]);
-        assert!(!add_partition.needs_range_boundaries());
-
-        // Hash creation, likewise.
-        let mut hash = range_cutover_config();
-        hash.partition_strategy = PartitionStrategy::Hash;
-        hash.template_table = Some("public.events_template".to_string());
-        hash.hash_modulus = Some(8);
-        assert!(!hash.needs_range_boundaries());
-
-        // A non-range cutover has no boundaries either — this is what stops the
-        // orchestrator demanding a start_date that means nothing to the plan.
+        // List and hash have no period to compute, in either flow — this is
+        // what stops the orchestrator demanding a start_date that means
+        // nothing to the plan.
+        assert!(!list_template_config().needs_range_boundaries());
+        assert!(!hash_template_config().needs_range_boundaries());
         for strategy in [PartitionStrategy::List, PartitionStrategy::Hash] {
             let mut config = range_cutover_config();
             config.partition_strategy = strategy;
             assert!(!config.needs_range_boundaries());
         }
+
+        // Adding one list child is not a window either, even though the config
+        // it travels in carries a start_date left over from its defaults.
+        assert!(!add_list_partition_config().needs_range_boundaries());
+    }
+
+    #[test]
+    fn test_creation_shape_per_flow() {
+        // Only cutover gets a DEFAULT: a template-created table starts empty,
+        // and a row landing in DEFAULT would block that period's real
+        // partition from ever being created.
+        assert_eq!(
+            range_cutover_config().creation_shape(),
+            Some(PartitionCreationShape::RangeWindow { with_default: true })
+        );
+        assert_eq!(
+            range_template_config().creation_shape(),
+            Some(PartitionCreationShape::RangeWindow {
+                with_default: false
+            })
+        );
+
+        assert_eq!(
+            hash_template_config().creation_shape(),
+            Some(PartitionCreationShape::HashBuckets)
+        );
+
+        assert_eq!(
+            add_list_partition_config().creation_shape(),
+            Some(PartitionCreationShape::SingleListPartition)
+        );
+
+        // The list template flow creates no children at all, so a plan pairing
+        // it with a CreatePartition action is malformed rather than defaulting
+        // to some other shape.
+        assert_eq!(list_template_config().creation_shape(), None);
+    }
+
+    #[test]
+    fn test_creation_shape_prefers_single_list_partition_over_strategy() {
+        // `add-partition` against a table whose registered strategy somehow
+        // reads as range must still build one list child — the explicit values
+        // are the more specific signal.
+        let mut config = add_list_partition_config();
+        config.partition_strategy = PartitionStrategy::Range;
+        assert_eq!(
+            config.creation_shape(),
+            Some(PartitionCreationShape::SingleListPartition)
+        );
     }
 }

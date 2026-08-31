@@ -34,6 +34,33 @@ impl Planner {
         table: &str,
         config: &MigrationConfig,
     ) -> Result<Plan> {
+        // Enforced here rather than only in the CLI so the library path is
+        // guarded too. Without this, a list cutover produced a perfectly
+        // well-formed plan whose AttachPartition action carried a
+        // `FOR VALUES FROM (MINVALUE) TO (…)` bound — meaningless to a LIST
+        // parent — and it failed at *apply* time, after the bounding CHECK had
+        // already been added to and validated on the real table.
+        match config.partition_strategy {
+            PartitionStrategy::Range => {}
+            PartitionStrategy::Hash => {
+                return Err(anyhow::anyhow!(
+                    "Converting an existing table is supported for range only (got hash). A \
+                     hash-partitioned table cannot have a DEFAULT partition, so there is no \
+                     bucket that could hold the existing rows — create a new table with \
+                     --template-table instead."
+                ))
+            }
+            PartitionStrategy::List => {
+                return Err(anyhow::anyhow!(
+                    "Converting an existing table is supported for range only (got list). \
+                     Converting to LIST would mean attaching the existing table as the DEFAULT \
+                     partition and draining it before any FOR VALUES IN (…) partition could be \
+                     created — use --template-table to create a new list-partitioned table, \
+                     then `pg-partitioner add-partition`."
+                ))
+            }
+        }
+
         // Run validation first. `unique_index_missing_partition_key` is
         // downgraded to a warning rather than a hard block: the orchestrator's
         // CreateIndex step deliberately skips recreating unique/PK indexes
@@ -159,16 +186,17 @@ impl Planner {
 
     /// Plans creation of a new partitioned table from a template.
     ///
-    /// List and hash only. Range still reaches this flow through the same
-    /// `--template-table` switch but is rejected: it would need its own
-    /// default + premake-window child step, which isn't built here, and range
-    /// already has a complete path through cutover.
+    /// All three strategies, differing only in their middle step:
     ///
-    /// The two supported strategies differ only in their middle step. List
-    /// creates no children at all — they arrive one at a time via
-    /// `add-partition`. Hash creates its entire bucket set immediately,
-    /// because a hash table is only usable once every remainder is covered and
-    /// it can have no DEFAULT partition to catch what's missing.
+    /// - **List** creates no children at all — they arrive one at a time via
+    ///   `add-partition`.
+    /// - **Hash** creates its entire bucket set immediately, because a hash
+    ///   table is only usable once every remainder is covered and it can have
+    ///   no DEFAULT partition to catch what's missing.
+    /// - **Range** creates the period window from `start_date` forward, and
+    ///   deliberately *no* DEFAULT: the table starts empty, and a row landing
+    ///   in DEFAULT would block creating that period's real partition, which
+    ///   is what the next maintenance sweep would try to do.
     async fn plan_template_creation(
         client: &Client,
         schema: &str,
@@ -180,14 +208,6 @@ impl Planner {
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("plan_template_creation called without a template"))?;
         let (template_schema, template_table) = split_qualified_name(template)?;
-
-        if config.partition_strategy == PartitionStrategy::Range {
-            return Err(anyhow::anyhow!(
-                "Template-based creation supports --strategy list and hash (got range). \
-                 Range tables are created by converting an existing table — omit \
-                 --template-table and pass --start-date."
-            ));
-        }
 
         if config.partition_strategy == PartitionStrategy::Hash && config.hash_modulus.is_none() {
             return Err(anyhow::anyhow!(
@@ -215,6 +235,41 @@ impl Planner {
 
         let table_name = format!("{}.{}", schema, table);
 
+        // Range needs its period window resolved before the actions are built,
+        // both to describe the plan honestly and to warn about a start date
+        // that would produce an unreasonable number of partitions. Computed the
+        // same way the cutover path computes it, and — like there — not stored:
+        // the orchestrator recomputes the authoritative set at apply time.
+        let (start_date, range_boundary_count) =
+            if config.partition_strategy == PartitionStrategy::Range {
+                let start_date = config.start_date.clone().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "migration_config missing start_date; re-run `plan` with --start-date"
+                    )
+                })?;
+                let count = crate::migration::compute_partition_boundaries(
+                    client,
+                    &config.interval,
+                    config.premake_count,
+                    &start_date,
+                )
+                .await?
+                .len();
+
+                if count > crate::risk::PLANNER_RISK_PARTITION_COUNT {
+                    warnings.push(format!(
+                        "large_partition_count: this start date + interval would create {} \
+                         partitions, above the {}-partition planner-risk threshold",
+                        count.saturating_sub(1),
+                        crate::risk::PLANNER_RISK_PARTITION_COUNT
+                    ));
+                }
+
+                (start_date, count)
+            } else {
+                (String::new(), 0)
+            };
+
         let actions = match crate::migration::classify_template_target(
             client,
             schema,
@@ -237,8 +292,9 @@ impl Planner {
             // that runs plan-then-apply unconditionally stays correct.
             TemplateTargetState::AlreadyMatches => {
                 warnings.push(format!(
-                    "already_present: {} is already partitioned BY LIST ({}); nothing to create",
+                    "already_present: {} is already partitioned BY {} ({}); nothing to create",
                     table_name,
+                    config.partition_strategy.as_sql_keyword(),
                     config.partition_key.columns.join(", ")
                 ));
                 Vec::new()
@@ -258,18 +314,38 @@ impl Planner {
                     estimated_duration_secs: Some(1),
                 }];
 
-                if config.partition_strategy == PartitionStrategy::Hash {
-                    let modulus = config.hash_modulus.unwrap_or_default();
-                    actions.push(PlanAction {
-                        id: Uuid::new_v4().to_string(),
-                        action_type: ActionType::CreatePartition,
-                        table_name: table_name.clone(),
-                        description: format!(
-                            "Create {} hash bucket(s) for {} (MODULUS {})",
-                            modulus, table_name, modulus
-                        ),
-                        estimated_duration_secs: Some(1),
-                    });
+                match config.partition_strategy {
+                    PartitionStrategy::Hash => {
+                        let modulus = config.hash_modulus.unwrap_or_default();
+                        actions.push(PlanAction {
+                            id: Uuid::new_v4().to_string(),
+                            action_type: ActionType::CreatePartition,
+                            table_name: table_name.clone(),
+                            description: format!(
+                                "Create {} hash bucket(s) for {} (MODULUS {})",
+                                modulus, table_name, modulus
+                            ),
+                            estimated_duration_secs: Some(1),
+                        });
+                    }
+                    PartitionStrategy::Range => {
+                        actions.push(PlanAction {
+                            id: Uuid::new_v4().to_string(),
+                            action_type: ActionType::CreatePartition,
+                            table_name: table_name.clone(),
+                            description: format!(
+                                "Create {} range partition(s) for {} from {}, every {} \
+                                 (no DEFAULT partition)",
+                                range_boundary_count.saturating_sub(1),
+                                table_name,
+                                start_date,
+                                config.interval
+                            ),
+                            estimated_duration_secs: Some(1),
+                        });
+                    }
+                    // Children arrive later, via `add-partition`.
+                    PartitionStrategy::List => {}
                 }
 
                 actions.push(PlanAction {

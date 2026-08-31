@@ -96,6 +96,7 @@ impl Applier {
                 config.interval.clone(),
                 config.premake_count,
                 config.retention_policy.clone(),
+                config.hash_modulus,
             );
             crate::registrations::upsert_registration(client, &registration).await?;
             info!(

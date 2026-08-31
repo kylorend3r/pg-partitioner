@@ -7,6 +7,40 @@ use crate::migration;
 use crate::schema;
 use crate::types::{PartitionRegistration, PartitionStrategy, RetryPolicy};
 
+/// Whether a scheduled sweep can do anything for a registered table.
+///
+/// Only range has an answer to "what partition comes next": its children are a
+/// sequence of periods, so the window can be extended forward without touching
+/// a single existing row. The other two are recorded and reported, never
+/// maintained.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MaintenanceEligibility {
+    Maintainable,
+    Informational { reason: &'static str },
+}
+
+/// Pure by design (no `&Client`), so the rule that decides whether a table is
+/// ever touched by automation is testable on its own — see CLAUDE.md §4.1.
+pub fn maintenance_eligibility(strategy: PartitionStrategy) -> MaintenanceEligibility {
+    match strategy {
+        PartitionStrategy::Range => MaintenanceEligibility::Maintainable,
+        // The reason this is structural rather than unimplemented: a hash
+        // child's contents are decided by `hash(key) % modulus`. Adding a
+        // bucket changes the modulus, which changes that result for every row
+        // already stored — so it is not a partition creation at all, it is a
+        // full redistribution of the table. Nothing a maintenance sweep can
+        // do unattended.
+        PartitionStrategy::Hash => MaintenanceEligibility::Informational {
+            reason: "hash buckets are fixed at creation; adding one changes the modulus, \
+                     so every existing row would have to be rehashed and redistributed",
+        },
+        PartitionStrategy::List => MaintenanceEligibility::Informational {
+            reason: "list partitions are added deliberately, one value set at a time, \
+                     with `pg-partitioner add-partition`",
+        },
+    }
+}
+
 pub struct Maintainer;
 
 impl Maintainer {
@@ -29,10 +63,15 @@ impl Maintainer {
         client: &Client,
         registration: &PartitionRegistration,
     ) -> Result<Vec<String>> {
-        if registration.strategy != PartitionStrategy::Range {
+        // Defence in depth: the sweep already filters these out, but this is
+        // also a public entry point.
+        if let MaintenanceEligibility::Informational { reason } =
+            maintenance_eligibility(registration.strategy)
+        {
             info!(
                 table = format!("{}.{}", registration.schema_name, registration.table_name),
                 strategy = registration.strategy.as_registration_str(),
+                reason = reason,
                 "Skipping premake: only range-partitioned tables have a forward window"
             );
             return Ok(Vec::new());
@@ -114,10 +153,28 @@ impl Maintainer {
         let mut created_partitions = Vec::new();
         let mut dropped_partitions = Vec::new();
         let mut failed_tables = Vec::new();
-        let table_count = registrations.len();
+        let mut informational_tables = Vec::new();
+        let mut tables_processed = 0;
 
         for reg in registrations {
             let table_name = format!("{}.{}", reg.schema_name, reg.table_name);
+
+            // Counted separately rather than folded into `tables_processed`:
+            // reporting a hash table as "processed" overstates what the sweep
+            // did, and hides the fact that it can never do anything there.
+            if let MaintenanceEligibility::Informational { reason } =
+                maintenance_eligibility(reg.strategy)
+            {
+                informational_tables.push(format!(
+                    "{} ({}): {}",
+                    table_name,
+                    reg.strategy.as_registration_str(),
+                    reason
+                ));
+                continue;
+            }
+
+            tables_processed += 1;
 
             // Premake future partitions
             match Self::premake_future_partitions(client, &reg).await {
@@ -141,20 +198,28 @@ impl Maintainer {
         }
 
         Ok(MaintenanceSummary {
-            tables_processed: table_count,
+            tables_processed,
             created_partitions,
             dropped_partitions,
             failed_tables,
+            informational_tables,
         })
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MaintenanceSummary {
+    /// Registered tables the sweep could actually act on — range only.
+    /// Informational registrations are excluded rather than counted here.
     pub tables_processed: usize,
     pub created_partitions: Vec<String>,
     pub dropped_partitions: Vec<String>,
     pub failed_tables: Vec<String>,
+    /// `"schema.table (strategy): reason"` for every registration the sweep
+    /// deliberately left alone. `#[serde(default)]` so a summary serialized by
+    /// an older binary still deserializes.
+    #[serde(default)]
+    pub informational_tables: Vec<String>,
 }
 
 #[cfg(test)]
@@ -168,9 +233,36 @@ mod tests {
             created_partitions: vec!["events_2026_07_22_2026_07_23".to_string()],
             dropped_partitions: vec![],
             failed_tables: vec![],
+            informational_tables: vec![],
         };
 
         assert_eq!(summary.tables_processed, 5);
         assert_eq!(summary.created_partitions.len(), 1);
+    }
+
+    #[test]
+    fn test_only_range_is_maintainable() {
+        assert_eq!(
+            maintenance_eligibility(PartitionStrategy::Range),
+            MaintenanceEligibility::Maintainable
+        );
+
+        // Both non-range strategies are informational, and each says why —
+        // the reasons differ, so a single shared message would be wrong.
+        for strategy in [PartitionStrategy::List, PartitionStrategy::Hash] {
+            match maintenance_eligibility(strategy) {
+                MaintenanceEligibility::Informational { reason } => {
+                    assert!(!reason.is_empty(), "{:?} needs a reason", strategy)
+                }
+                MaintenanceEligibility::Maintainable => {
+                    panic!("{:?} must not be maintainable", strategy)
+                }
+            }
+        }
+
+        assert_ne!(
+            maintenance_eligibility(PartitionStrategy::List),
+            maintenance_eligibility(PartitionStrategy::Hash)
+        );
     }
 }
