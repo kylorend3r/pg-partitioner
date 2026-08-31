@@ -4,7 +4,7 @@ use tracing::info;
 
 use crate::orchestrator::Orchestrator;
 use crate::plan;
-use crate::types::{Plan, RetryPolicy};
+use crate::types::{ActionType, Plan, RetryPolicy};
 
 pub struct Applier {
     pub orchestrator: Orchestrator,
@@ -31,14 +31,30 @@ impl Applier {
             "Applying plan"
         );
 
-        // First, verify that the live schema hasn't drifted
-        let no_drift = plan::verify_plan_drift(client, schema, table, &plan_obj.schema_checksum).await?;
+        // First, verify that the live schema hasn't drifted. Usually that means
+        // the table the actions target, but a template-creation plan checksums
+        // its template instead — its target doesn't exist yet, and the template
+        // is what the target's structure will be copied from.
+        let (checksum_schema, checksum_table) = match plan_obj.checksum_table.as_deref() {
+            Some(qualified) => split_qualified_name(qualified)?,
+            None => (schema.to_string(), table.to_string()),
+        };
+
+        let no_drift = plan::verify_plan_drift(
+            client,
+            &checksum_schema,
+            &checksum_table,
+            &plan_obj.schema_checksum,
+        )
+        .await?;
 
         if !no_drift {
             return Err(anyhow!(
-                "Schema drift detected: live schema does not match plan's checksum. \
+                "Schema drift detected: live schema of {}.{} does not match plan's checksum. \
                  The table structure has changed since plan was computed. \
-                 Please re-run 'plan' to generate a new plan against the current schema."
+                 Please re-run 'plan' to generate a new plan against the current schema.",
+                checksum_schema,
+                checksum_table
             ));
         }
 
@@ -60,7 +76,17 @@ impl Applier {
             "Plan execution completed"
         );
 
-        if let Some(config) = &plan_obj.migration_config {
+        // Only a plan that stands up a partition *set* declares a table as
+        // managed. An `add-partition` plan touches one child of an
+        // already-known parent, so re-registering there would overwrite that
+        // parent's real interval/premake/retention settings with the inert
+        // placeholders such a plan carries.
+        let creates_partition_set = plan_obj
+            .actions
+            .iter()
+            .any(|a| matches!(a.action_type, ActionType::CreatePartitionSet));
+
+        if let (true, Some(config)) = (creates_partition_set, &plan_obj.migration_config) {
             crate::registrations::create_registrations_table(client).await?;
             let registration = crate::registrations::new_registration(
                 schema.to_string(),
@@ -70,6 +96,7 @@ impl Applier {
                 config.interval.clone(),
                 config.premake_count,
                 config.retention_policy.clone(),
+                config.hash_modulus,
             );
             crate::registrations::upsert_registration(client, &registration).await?;
             info!(
@@ -82,9 +109,36 @@ impl Applier {
     }
 }
 
+fn split_qualified_name(qualified: &str) -> Result<(String, String)> {
+    match qualified.splitn(2, '.').collect::<Vec<&str>>().as_slice() {
+        [schema, table] if !schema.is_empty() && !table.is_empty() => {
+            Ok((schema.to_string(), table.to_string()))
+        }
+        _ => Err(anyhow!(
+            "Expected a schema-qualified name in the form 'schema.table', got: {}",
+            qualified
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_split_qualified_name() {
+        assert_eq!(
+            split_qualified_name("public.events").unwrap(),
+            ("public".to_string(), "events".to_string())
+        );
+
+        // A malformed `checksum_table` must fail loudly rather than silently
+        // drift-checking the wrong relation.
+        assert!(split_qualified_name("events").is_err());
+        assert!(split_qualified_name(".events").is_err());
+        assert!(split_qualified_name("public.").is_err());
+        assert!(split_qualified_name("").is_err());
+    }
 
     #[test]
     fn test_applier_creation() {

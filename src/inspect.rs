@@ -7,9 +7,10 @@ use tokio_postgres::Client;
 use crate::registrations;
 use crate::risk;
 use crate::schema;
+use crate::maintain::{maintenance_eligibility, MaintenanceEligibility};
 use crate::types::{
-    InspectReport, PartitionRegistration, PartitionSetInfo, ReconciliationEntry,
-    ReconciliationStatus, ReconciliationSummary,
+    InspectReport, PartitionRegistration, PartitionSetInfo, PartitionStrategy,
+    ReconciliationEntry, ReconciliationStatus, ReconciliationSummary,
 };
 
 pub async fn inspect_database(
@@ -100,12 +101,43 @@ fn reconcile(
                     ));
                 }
 
+                // For hash — and only for hash — every child is a bucket, so
+                // the live child count *is* the modulus. A mismatch means a
+                // bucket was dropped or added by hand, which silently breaks
+                // the table for every row that hashes to the missing remainder;
+                // there is no DEFAULT partition to catch them.
+                if registration.strategy == PartitionStrategy::Hash {
+                    match registration.hash_modulus {
+                        Some(modulus) if modulus != live.child_count => {
+                            mismatches.push(format!(
+                                "hash buckets: registered modulus={} actual children={}",
+                                modulus, live.child_count
+                            ));
+                        }
+                        // `None` means the row predates the hash_modulus
+                        // column, not that the table has no buckets — there is
+                        // nothing to compare against, so say nothing.
+                        _ => {}
+                    }
+                }
+
                 if mismatches.is_empty() {
+                    let detail = match maintenance_eligibility(registration.strategy) {
+                        MaintenanceEligibility::Maintainable => {
+                            "Registered configuration matches the live catalog".to_string()
+                        }
+                        MaintenanceEligibility::Informational { reason } => format!(
+                            "Registered configuration matches the live catalog; \
+                             informational only, never maintained — {}",
+                            reason
+                        ),
+                    };
+
                     entries.push(ReconciliationEntry {
                         schema_name: registration.schema_name.clone(),
                         table_name: registration.table_name.clone(),
                         status: ReconciliationStatus::Healthy,
-                        detail: "Registered configuration matches the live catalog".to_string(),
+                        detail,
                     });
                 } else {
                     entries.push(ReconciliationEntry {

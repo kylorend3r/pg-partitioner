@@ -11,10 +11,13 @@ pub struct TenantPartitioningConfig {
     pub archive_on_churn: bool,
 }
 
+/// No `tenant_column` parameter: a `PARTITION OF … FOR VALUES IN (…)` bound is
+/// matched against whatever column the *parent* was declared `PARTITION BY LIST`
+/// on, so naming it here would be decorative — the DDL has nowhere to put it.
+/// It used to be taken and ignored.
 pub async fn create_tenant_partition(
     client: &Client,
     table_name: &str,
-    tenant_column: &str,
     tenant_id: &str,
 ) -> Result<String> {
     let partition_name = format!("{}_{}", table_name, tenant_id);
