@@ -6,10 +6,15 @@ use crate::types::{MigrationConfig, PartitionKey, PartitionStrategy};
 pub struct SetupWizard;
 
 impl SetupWizard {
-    pub async fn run_interactive_setup(client: &Client, schema: &str, table: &str) -> Result<MigrationConfig> {
-        // For Phase 1, we provide a simplified wizard that defaults to time-series partitioning
-        // A full interactive version with dialoguer would be added in a future phase
-
+    /// Not yet interactive: returns a fixed monthly-range config rather than
+    /// asking anything, so `_client` has nothing to inspect. A real wizard would
+    /// use the connection to suggest a key and interval from the table's own
+    /// columns and growth rate.
+    pub async fn run_interactive_setup(
+        _client: &Client,
+        schema: &str,
+        table: &str,
+    ) -> Result<MigrationConfig> {
         let partition_key = PartitionKey::single("created_at".to_string());
 
         let config = MigrationConfig {

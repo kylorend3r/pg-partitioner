@@ -1,6 +1,5 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use tokio_postgres::Client;
 
 use crate::maintain::{MaintenanceSummary, Maintainer};
@@ -70,8 +69,12 @@ impl FleetManager {
         })
     }
 
+    /// Health is derived from the registration alone for now. `_client` is the
+    /// unused half of this: `rows`/`size_mb`/`partitions` below are placeholders
+    /// that would need a catalog read to fill in, which is why the connection is
+    /// threaded through but never used.
     async fn get_table_status(
-        client: &Client,
+        _client: &Client,
         registration: &PartitionRegistration,
     ) -> Result<TableFleetStatus> {
         // Determine health status based on registration

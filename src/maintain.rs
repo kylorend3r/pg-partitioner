@@ -129,8 +129,11 @@ impl Maintainer {
         Ok(created)
     }
 
+    /// Placeholder: logs the policy it would enforce and drops nothing. The
+    /// selection logic it needs lives in `retention.rs` and is itself unfinished,
+    /// which is why `_client` goes unused — there is no query to run yet.
     pub async fn enforce_retention_policy(
-        client: &Client,
+        _client: &Client,
         registration: &PartitionRegistration,
     ) -> Result<Vec<String>> {
         if let Some(policy) = &registration.retention_policy {

@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
@@ -309,6 +309,26 @@ fn parse_retention_type(s: &str) -> Result<RetentionType> {
     }
 }
 
+/// Reads a plan file in either format `plan --format` can write.
+///
+/// JSON is tried first: it is the default and the overwhelmingly common case,
+/// and since `serde_yaml` accepts most JSON too, letting YAML go first would
+/// report a JSON syntax error in YAML's terms and send the reader looking in
+/// the wrong place. When both fail, both errors are surfaced — which one
+/// matters depends on what the author meant to write.
+fn parse_plan(contents: &str) -> Result<pg_partitioner::types::Plan> {
+    match serde_json::from_str::<pg_partitioner::types::Plan>(contents) {
+        Ok(plan) => Ok(plan),
+        Err(json_error) => serde_yaml::from_str(contents).map_err(|yaml_error| {
+            anyhow::anyhow!(
+                "not valid JSON ({}) and not valid YAML ({})",
+                json_error,
+                yaml_error
+            )
+        }),
+    }
+}
+
 fn parse_start_date(s: &str) -> Result<chrono::NaiveDate> {
     let date = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
         .map_err(|e| anyhow::anyhow!("Invalid --start-date '{}' (expected YYYY-MM-DD): {}", s, e))?;
@@ -510,13 +530,25 @@ async fn main() -> Result<()> {
 
             let plan_obj = plan::Planner::plan_migration(&client, &schema, &table, &config).await?;
 
+            // `--format` used to be accepted and then ignored, so `--format yaml`
+            // silently produced JSON. An unknown value is rejected rather than
+            // falling back, for the same reason.
+            let rendered = match format.as_str() {
+                "json" => serde_json::to_string_pretty(&plan_obj)?,
+                "yaml" => serde_yaml::to_string(&plan_obj)?,
+                other => {
+                    return Err(anyhow::anyhow!(
+                        "Unknown --format '{}' (expected json or yaml)",
+                        other
+                    ))
+                }
+            };
+
             if let Some(output_path) = output {
-                let plan_json = serde_json::to_string_pretty(&plan_obj)?;
-                std::fs::write(&output_path, plan_json)?;
+                std::fs::write(&output_path, rendered)?;
                 println!("Plan written to {}", output_path.display());
             } else {
-                let plan_json = serde_json::to_string_pretty(&plan_obj)?;
-                println!("{}", plan_json);
+                println!("{}", rendered);
             }
 
             if !plan_obj.warnings.is_empty() {
@@ -529,7 +561,8 @@ async fn main() -> Result<()> {
 
         Some(Commands::Apply { plan_file, dry_run }) => {
             let plan_contents = std::fs::read_to_string(&plan_file)?;
-            let plan_obj: pg_partitioner::types::Plan = serde_json::from_str(&plan_contents)?;
+            let plan_obj = parse_plan(&plan_contents)
+                .with_context(|| format!("Failed to read plan file {}", plan_file.display()))?;
 
             if dry_run {
                 println!("DRY RUN: Would apply {} actions", plan_obj.actions.len());
@@ -736,4 +769,64 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pg_partitioner::types::{ActionType, Plan, PlanAction};
+
+    fn sample_plan() -> Plan {
+        Plan {
+            version: "1.0".to_string(),
+            created_at: "2026-08-31T00:00:00Z".to_string(),
+            database: "app".to_string(),
+            schema_checksum: "abc123".to_string(),
+            actions: vec![PlanAction {
+                id: "action-1".to_string(),
+                action_type: ActionType::CreatePartitionSet,
+                table_name: "public.events".to_string(),
+                description: "Create public.events".to_string(),
+                estimated_duration_secs: Some(1),
+            }],
+            migration_config: None,
+            checksum_table: Some("public.events_template".to_string()),
+            warnings: vec![],
+        }
+    }
+
+    #[test]
+    fn test_parse_plan_accepts_both_formats_plan_can_write() {
+        // The round trip that matters: whatever `plan --format` emits, `apply`
+        // has to be able to read back.
+        for rendered in [
+            serde_json::to_string_pretty(&sample_plan()).expect("serializes as JSON"),
+            serde_yaml::to_string(&sample_plan()).expect("serializes as YAML"),
+        ] {
+            let parsed = parse_plan(&rendered).expect("round-trips");
+            assert_eq!(parsed.actions.len(), 1);
+            assert_eq!(parsed.actions[0].table_name, "public.events");
+            assert_eq!(
+                parsed.checksum_table.as_deref(),
+                Some("public.events_template")
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_plan_rejects_garbage_naming_both_parsers() {
+        // A file that is neither must not be reported as only one kind of
+        // failure — the author knows which they meant to write.
+        let error = parse_plan("{ this is not a plan").unwrap_err().to_string();
+        assert!(error.contains("not valid JSON"), "{}", error);
+        assert!(error.contains("not valid YAML"), "{}", error);
+    }
+
+    #[test]
+    fn test_parse_start_date_rejects_future_and_malformed() {
+        assert!(parse_start_date("2020-01-01").is_ok());
+        assert!(parse_start_date("2999-01-01").is_err());
+        assert!(parse_start_date("01-01-2020").is_err());
+        assert!(parse_start_date("").is_err());
+    }
 }

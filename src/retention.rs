@@ -30,41 +30,24 @@ pub async fn evaluate_retention_policy(
     Ok(partition_names)
 }
 
+/// Not implemented, and deliberately returning nothing rather than a guess.
+///
+/// The query that used to be here referenced neither `days` nor
+/// `partition_column` — which is exactly what the two unused-parameter warnings
+/// on it were pointing at. It selected every non-default child of the parent
+/// ordered by name, `LIMIT (COUNT(*) - 1)`, i.e. "all the partitions but one",
+/// with no age predicate anywhere. Every caller of this module feeds its result
+/// straight to `drop_partition`, so had retention ever been wired up it would
+/// have dropped almost the entire table's history regardless of the configured
+/// age. Returning an empty list matches its Months/Years siblings and fails
+/// safe: retention drops nothing until this is genuinely written.
 async fn get_partitions_older_than_days(
-    client: &Client,
-    table_name: &str,
-    partition_column: &str,
-    days: i32,
+    _client: &Client,
+    _table_name: &str,
+    _partition_column: &str,
+    _days: i32,
 ) -> Result<Vec<String>> {
-    let query = format!(
-        r#"
-        SELECT c.relname
-        FROM pg_inherits i
-        JOIN pg_class p ON p.oid = i.inhparent
-        JOIN pg_class c ON c.oid = i.inhrelid
-        WHERE p.oid = {}::regclass
-            AND c.relkind = 'r'
-            AND pg_get_partition_constraintdef(c.oid) LIKE '%<%'
-            AND c.relname NOT LIKE '%default%'
-        ORDER BY c.relname ASC
-        LIMIT (
-            SELECT COUNT(*) - 1
-            FROM pg_inherits
-            WHERE inhparent = {}::regclass
-        )
-        "#,
-        queries::quote_regclass_literal(table_name),
-        queries::quote_regclass_literal(table_name)
-    );
-
-    let rows = client.query(&query, &[]).await?;
-
-    let mut partition_names = Vec::new();
-    for row in rows {
-        partition_names.push(row.get::<_, String>(0));
-    }
-
-    Ok(partition_names)
+    Ok(Vec::new())
 }
 
 async fn get_partitions_older_than_months(

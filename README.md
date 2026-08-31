@@ -438,7 +438,7 @@ Setup
 Plan → apply
   plan           compute desired vs. current state, preflight-validate, write a checksummed plan
                  (with --template-table: create a new table, any strategy; without it: convert
-                 an existing table, range only)
+                 an existing table, range only). --format json|yaml; apply reads either
   apply          re-checksum live schema against the plan (refuses on drift), execute
   add-partition  add one FOR VALUES IN (...) partition to a list-partitioned table
 

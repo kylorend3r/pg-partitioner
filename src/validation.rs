@@ -563,24 +563,19 @@ async fn validate_lock_budget(client: &Client) -> Result<Vec<ValidationError>> {
     Ok(errors)
 }
 
+/// Placeholder. A real check would compare the server's `timezone` setting with
+/// the client's and flag a `timestamp without time zone` partition key, which is
+/// where the mismatch actually bites — a boundary computed in one zone and
+/// evaluated in another lands rows in the neighbouring partition.
+///
+/// It previously read `current_setting('timezone')` and threw the answer away,
+/// spending a round trip per `plan` to reach the same empty result. Kept wired
+/// into both planning paths so the check has somewhere to land when written.
 async fn validate_timezone_compatibility(
-    client: &Client,
-    partition_key: &PartitionKey,
+    _client: &Client,
+    _partition_key: &PartitionKey,
 ) -> Result<Vec<ValidationError>> {
-    let mut errors = Vec::new();
-
-    // Check if partition key is a timestamp column
-    if partition_key.columns.iter().any(|c| c.contains("time") || c.contains("date")) {
-        let row = client
-            .query_one("SELECT current_setting('timezone')", &[])
-            .await?;
-        let _tz: String = row.get(0);
-
-        // Note: A more thorough check would compare server timezone with client timezone
-        // For now, we just flag potential timezone usage
-    }
-
-    Ok(errors)
+    Ok(Vec::new())
 }
 
 #[cfg(test)]

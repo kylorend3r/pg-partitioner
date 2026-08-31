@@ -88,29 +88,26 @@ pub async fn get_recent_logs(
     table_name: Option<&str>,
     limit: i64,
 ) -> Result<Vec<LogEntry>> {
-    let (query, rows) = if let Some(table) = table_name {
-        let q = r#"
+    // The two branches differ only in their WHERE clause and bind list, so only
+    // the rows survive; the query text was being carried out of the `if` and
+    // then dropped.
+    let rows = if let Some(table) = table_name {
+        let query = r#"
             SELECT id, timestamp, action, table_name, status, details, duration_ms
             FROM partitioner.partitioner_logbook
             WHERE table_name = $1
             ORDER BY timestamp DESC
             LIMIT $2
         "#;
-        (
-            q,
-            client
-                .query(q, &[&table, &limit])
-                .await?,
-        )
+        client.query(query, &[&table, &limit]).await?
     } else {
-        let q = r#"
+        let query = r#"
             SELECT id, timestamp, action, table_name, status, details, duration_ms
             FROM partitioner.partitioner_logbook
             ORDER BY timestamp DESC
             LIMIT $1
         "#;
-        let rows = client.query(q, &[&limit]).await?;
-        (q, rows)
+        client.query(query, &[&limit]).await?
     };
 
     let mut entries = Vec::new();

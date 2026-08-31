@@ -139,6 +139,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **`tenant::create_tenant_partition` no longer takes a `tenant_column` argument.** A
+  `PARTITION OF … FOR VALUES IN (…)` bound is matched against the column the parent was declared
+  `PARTITION BY LIST` on, so the parameter had nowhere to go and was silently ignored. Library API
+  only — no command exposes this module.
+
 - **`maintain`'s "tables processed" now counts only the tables it can actually act on.** It
   previously counted every registration, including the hash and list tables it skips, which
   overstated what a sweep had done — a run that touched nothing still reported every registered
@@ -166,6 +171,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   claimed all roadmap phases were complete and pointed at a document describing removed commands.
 
 ### Fixed
+
+- **`plan --format yaml` silently wrote JSON.** The flag was parsed and then never read, so the
+  documented `json | yaml` choice had exactly one outcome. `--format yaml` now writes YAML,
+  `apply` reads a plan file in either format, and an unrecognised `--format` is rejected rather
+  than falling back to JSON.
+
+- **Retention's "older than N days" selection ignored the age entirely.** The query behind
+  `RetentionType::Days` referenced neither the day count nor the partition column; it selected
+  every non-default child of the parent ordered by name, `LIMIT (COUNT(*) - 1)` — "all the
+  partitions but one". Since the result feeds straight into `drop_partition`, wiring retention up
+  would have dropped nearly a table's entire history no matter what policy was configured. It now
+  returns nothing, matching its months/years counterparts, so retention stays a no-op until it is
+  genuinely implemented rather than a destructive one.
 
 - **Converting an existing table to list or hash produced a plan that failed half-way through the
   migration.** `plan --strategy list` without `--template-table` fell into the cutover path and
