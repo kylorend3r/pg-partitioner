@@ -152,6 +152,24 @@ cat plan.json | jq '.warnings'
 
 **What `--start-date` actually controls**: data older than this date lands in one `MINVALUE`-bounded legacy partition (same as before); from `--start-date` forward through today plus `--premake` periods, you get a real, individually-named partition per period — not just one undifferentiated bucket for all pre-existing data. If that span is large (e.g. a `--start-date` years back with daily partitions), `plan` warns rather than blocking — check `.warnings` for a `large_partition_count` entry before you `apply`.
 
+**A table with an identity column can't be converted as-is.** PostgreSQL doesn't allow a partition
+to own an identity column — identity belongs on the parent, which children inherit — so the
+original table can't be attached under the new parent. `plan` refuses with
+`identity_column_unsupported` rather than letting `apply` discover it half-way through. Convert the
+column to a plain sequence default first, which the cutover does carry over:
+
+```sql
+ALTER TABLE public.events ALTER COLUMN id DROP IDENTITY;
+CREATE SEQUENCE events_id_seq OWNED BY public.events.id;
+SELECT setval('events_id_seq', (SELECT COALESCE(max(id), 1) FROM public.events));
+ALTER TABLE public.events ALTER COLUMN id SET DEFAULT nextval('events_id_seq');
+```
+
+Read that as a real schema change rather than a rename: `GENERATED ALWAYS AS IDENTITY` **rejects**
+a user-supplied value for the column, and a plain default happily accepts one. If you were relying
+on that rejection, you lose it. `bigserial` and `uuid DEFAULT gen_random_uuid()` columns need none
+of this — they're ordinary defaults and convert cleanly.
+
 A normal OLTP table (surrogate `id` primary key, not on `created_at`) will show a warning like:
 
 ```

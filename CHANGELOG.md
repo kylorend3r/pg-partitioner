@@ -9,6 +9,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Warning when a template's identity column won't be copied.** Creating a table from a template
+  that has an identity column succeeds, but the new table's column arrives with neither the
+  identity nor a default, so the first `INSERT` that omits it fails on a NOT NULL column. Reported
+  as `identity_column_not_copied` — a warning, not a blocker, since the rest of the table is fine.
+
+
 - **Plans state their execution order.** `PlanAction` gains a 1-based `sequence`, so the order is
   written into the plan file rather than left to be inferred from array position, and `plan` and
   `apply --dry-run` print a numbered list:
@@ -202,6 +208,36 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   claimed all roadmap phases were complete and pointed at a document describing removed commands.
 
 ### Fixed
+
+- **Converting a table with an identity column failed half-way through the migration.** PostgreSQL
+  does not allow a partition to own an identity column, and the shadow parent is built with
+  `LIKE … INCLUDING DEFAULTS`, which does not carry identity across — so the original kept it and
+  could never be attached. The cutover died at the ATTACH step, *after* the bounding CHECK had been
+  added to and validated on the real table:
+
+  ```
+  table "events_legacy" being attached contains an identity column "id"
+  DETAIL: The new partition may not contain an identity column. (SQLSTATE: 55000)
+  ```
+
+  `plan` now refuses up front with `identity_column_unsupported` and says how to proceed: convert
+  the column to a plain sequence default, which the cutover *does* carry over.
+
+  ```sql
+  ALTER TABLE public.events ALTER COLUMN id DROP IDENTITY;
+  CREATE SEQUENCE events_id_seq OWNED BY public.events.id;
+  SELECT setval('events_id_seq', (SELECT COALESCE(max(id), 1) FROM public.events));
+  ALTER TABLE public.events ALTER COLUMN id SET DEFAULT nextval('events_id_seq');
+  ```
+
+  Not a like-for-like swap: `GENERATED ALWAYS AS IDENTITY` rejects user-supplied values for the
+  column and a plain default does not. `bigserial` and `uuid DEFAULT gen_random_uuid()` columns are
+  unaffected — they are ordinary defaults, and always worked.
+
+- **Validation told you what was wrong but never what to do about it.** Every `ValidationError`
+  carries a `suggestion`, and `plan` discarded all of them when rendering, so an operator got a
+  diagnosis and no remedy. Suggestions are now printed with the error that carries them.
+
 
 - **A failed migration didn't say what went wrong.** `tokio_postgres::Error`'s `Display` is the
   fixed string `"db error"` — the message, `DETAIL`, `HINT` and the relation or constraint involved

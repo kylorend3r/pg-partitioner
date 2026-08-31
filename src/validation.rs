@@ -27,6 +27,13 @@ pub async fn validate_table_for_partitioning(
         validate_partition_key_columns(client, schema, table, &config.partition_key).await?,
     );
 
+    errors.extend(identity_column_errors(
+        schema,
+        table,
+        &identity_columns(client, schema, table).await?,
+        IdentityFlow::Cutover,
+    ));
+
     // Check the key's shape is legal for the requested strategy
     errors.extend(validate_strategy_key_shape(config));
 
@@ -46,6 +53,95 @@ pub async fn validate_table_for_partitioning(
     errors.extend(validate_timezone_compatibility(client, &config.partition_key).await?);
 
     Ok(errors)
+}
+
+/// Which planning flow is asking about an identity column, and therefore how
+/// much it matters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdentityFlow {
+    /// Converting an existing table. A hard blocker: PostgreSQL refuses to
+    /// attach a partition that owns an identity column.
+    Cutover,
+    /// Creating a new table from a template. Advisory: everything else about
+    /// the table is fine, but the identity is silently not copied.
+    TemplateCreation,
+}
+
+/// Names of `schema.table`'s identity columns.
+///
+/// Read from `information_schema` rather than `pg_attribute.attidentity` on
+/// purpose: `attidentity` is a `"char"` (so it would need `::text`, exactly like
+/// `partstrat`), and addressing the table by OID would want a `::regclass`
+/// parameter, which a Rust `String` cannot bind against. Plain text parameters
+/// against `information_schema` sidestep both traps -- see CLAUDE.md §3.
+async fn identity_columns(client: &Client, schema: &str, table: &str) -> Result<Vec<String>> {
+    let query = "SELECT column_name FROM information_schema.columns
+                 WHERE table_schema = $1 AND table_name = $2 AND is_identity = 'YES'
+                 ORDER BY ordinal_position";
+
+    let rows = client.query(query, &[&schema, &table]).await?;
+
+    Ok(rows.iter().map(|row| row.get::<_, String>(0)).collect())
+}
+
+/// Turns identity column names into the right finding for the flow.
+///
+/// Pure so the severity decision is testable without a connection; the catalog
+/// read above stays a thin fetch (CLAUDE.md §4.1).
+fn identity_column_errors(
+    schema: &str,
+    table: &str,
+    columns: &[String],
+    flow: IdentityFlow,
+) -> Vec<ValidationError> {
+    columns
+        .iter()
+        .map(|column| match flow {
+            // PostgreSQL rejects `ATTACH PARTITION` outright when the table
+            // being attached owns an identity column -- identity belongs to the
+            // parent, which the children inherit. The cutover's shadow parent is
+            // built with `LIKE ... INCLUDING DEFAULTS`, which does not carry
+            // identity, so the original keeps it and can never be attached.
+            IdentityFlow::Cutover => ValidationError {
+                category: "identity_column_unsupported".to_string(),
+                message: format!(
+                    "{}.{} has identity column '{}'. Converting an existing table is not \
+                     supported for identity columns: PostgreSQL does not allow a partition to \
+                     own one, so the table cannot be attached under the new parent",
+                    schema, table, column
+                ),
+                suggestion: Some(format!(
+                    "Convert it to a plain sequence default first, which the cutover does carry \
+                     over: ALTER TABLE {schema}.{table} ALTER COLUMN {column} DROP IDENTITY; \
+                     CREATE SEQUENCE {table}_{column}_seq OWNED BY {schema}.{table}.{column}; \
+                     SELECT setval('{table}_{column}_seq', (SELECT COALESCE(max({column}), 1) \
+                     FROM {schema}.{table})); ALTER TABLE {schema}.{table} ALTER COLUMN {column} \
+                     SET DEFAULT nextval('{table}_{column}_seq'); -- note GENERATED ALWAYS \
+                     rejects user-supplied values and a plain default does not",
+                    schema = schema,
+                    table = table,
+                    column = column
+                )),
+            },
+            // Nothing fails here, which is the problem: the new table is created
+            // with the column but without its identity or any default, so the
+            // first INSERT that omits it fails on a NOT NULL column.
+            IdentityFlow::TemplateCreation => ValidationError {
+                category: "identity_column_not_copied".to_string(),
+                message: format!(
+                    "Template {}.{} has identity column '{}', which is not copied to the new \
+                     table: the column is created without its identity and without a default, \
+                     so an INSERT that omits it will fail",
+                    schema, table, column
+                ),
+                suggestion: Some(format!(
+                    "After applying, give the new table's column a generator, e.g. ALTER TABLE \
+                     ... ALTER COLUMN {} ADD GENERATED BY DEFAULT AS IDENTITY",
+                    column
+                )),
+            },
+        })
+        .collect()
 }
 
 async fn validate_partition_key_columns(
@@ -391,6 +487,13 @@ pub async fn validate_template_creation(
 
     errors.extend(validate_strategy_key_shape(config));
 
+    errors.extend(identity_column_errors(
+        template_schema,
+        template_table,
+        &identity_columns(client, template_schema, template_table).await?,
+        IdentityFlow::TemplateCreation,
+    ));
+
     if config.partition_strategy == PartitionStrategy::Hash {
         errors.extend(
             validate_hash_key_types(client, template_schema, template_table, &config.partition_key)
@@ -552,6 +655,44 @@ async fn validate_timezone_compatibility(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_identity_column_errors_blocks_cutover_and_warns_on_template() {
+        let columns = vec!["id".to_string()];
+
+        let cutover = identity_column_errors("public", "events", &columns, IdentityFlow::Cutover);
+        assert_eq!(cutover.len(), 1);
+        assert_eq!(cutover[0].category, "identity_column_unsupported");
+
+        let template = identity_column_errors(
+            "public",
+            "events_template",
+            &columns,
+            IdentityFlow::TemplateCreation,
+        );
+        assert_eq!(template.len(), 1);
+        assert_eq!(template[0].category, "identity_column_not_copied");
+    }
+
+    #[test]
+    fn test_identity_column_errors_reports_every_column() {
+        // A table can legally have more than one identity column, and each is
+        // its own reason the attach would fail.
+        let columns = vec!["id".to_string(), "seq_no".to_string()];
+        let errors = identity_column_errors("public", "events", &columns, IdentityFlow::Cutover);
+
+        assert_eq!(errors.len(), 2);
+        assert!(errors.iter().all(|e| e.suggestion.is_some()));
+    }
+
+    #[test]
+    fn test_identity_column_errors_says_nothing_when_there_are_none() {
+        // The common case: bigserial and uuid defaults are not identity columns
+        // and must not be caught.
+        for flow in [IdentityFlow::Cutover, IdentityFlow::TemplateCreation] {
+            assert!(identity_column_errors("public", "events", &[], flow).is_empty());
+        }
+    }
     use crate::types::PartitionStrategy;
 
     fn config_with(strategy: PartitionStrategy, key: PartitionKey) -> MigrationConfig {
