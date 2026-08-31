@@ -551,6 +551,20 @@ async fn main() -> Result<()> {
                 println!("{}", rendered);
             }
 
+            // The order the actions will run in, stated rather than left to be
+            // inferred from array position in the JSON.
+            if !plan_obj.actions.is_empty() {
+                println!("\nExecution order:");
+                for action in &plan_obj.actions {
+                    println!(
+                        "  {}. {} — {}",
+                        action.sequence,
+                        action.action_type.to_string(),
+                        action.description
+                    );
+                }
+            }
+
             if !plan_obj.warnings.is_empty() {
                 println!("\nWarnings:");
                 for warning in &plan_obj.warnings {
@@ -565,9 +579,17 @@ async fn main() -> Result<()> {
                 .with_context(|| format!("Failed to read plan file {}", plan_file.display()))?;
 
             if dry_run {
-                println!("DRY RUN: Would apply {} actions", plan_obj.actions.len());
+                println!(
+                    "DRY RUN: Would apply {} actions, in this order:",
+                    plan_obj.actions.len()
+                );
                 for action in &plan_obj.actions {
-                    println!("  - {}: {}", action.action_type.to_string(), action.description);
+                    println!(
+                        "  {}. {}: {}",
+                        action.sequence,
+                        action.action_type.to_string(),
+                        action.description
+                    );
                 }
             } else {
                 // Extract schema and table from the first action (simplified for Phase 1).
@@ -615,7 +637,12 @@ async fn main() -> Result<()> {
             if dry_run {
                 println!("DRY RUN: Would apply {} action(s)", plan_obj.actions.len());
                 for action in &plan_obj.actions {
-                    println!("  - {}: {}", action.action_type.to_string(), action.description);
+                    println!(
+                        "  {}. {}: {}",
+                        action.sequence,
+                        action.action_type.to_string(),
+                        action.description
+                    );
                 }
             } else {
                 let applier = apply::Applier::new(None);
@@ -788,6 +815,7 @@ mod tests {
                 table_name: "public.events".to_string(),
                 description: "Create public.events".to_string(),
                 estimated_duration_secs: Some(1),
+                sequence: 1,
             }],
             migration_config: None,
             checksum_table: Some("public.events_template".to_string()),

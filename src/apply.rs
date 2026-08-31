@@ -4,7 +4,7 @@ use tracing::info;
 
 use crate::orchestrator::Orchestrator;
 use crate::plan;
-use crate::types::{ActionType, Plan, RetryPolicy};
+use crate::types::{ActionType, Plan, PlanAction, RetryPolicy};
 
 pub struct Applier {
     pub orchestrator: Orchestrator,
@@ -60,6 +60,12 @@ impl Applier {
 
         info!("Schema checksum matches - proceeding with plan execution");
 
+        // The list order is what actually executes; `sequence` only states it.
+        // Checking them against each other is what stops the field becoming a
+        // second source of truth — a hand-edited plan whose numbers disagree is
+        // refused rather than quietly running in an order it doesn't claim.
+        verify_action_order(&plan_obj.actions)?;
+
         // Execute all actions in order through the orchestrator
         let results = self
             .orchestrator
@@ -109,6 +115,31 @@ impl Applier {
     }
 }
 
+/// Errors when a plan's stated execution order disagrees with the order it
+/// would actually run in.
+///
+/// `sequence == 0` means the field was absent from the plan file — every action
+/// in a plan written before `sequence` existed reads that way — so those are
+/// skipped rather than treated as a real position.
+fn verify_action_order(actions: &[PlanAction]) -> Result<()> {
+    for (index, action) in actions.iter().enumerate() {
+        let expected = index + 1;
+        if action.sequence != 0 && action.sequence != expected {
+            return Err(anyhow!(
+                "Plan is inconsistent: the action at position {} says it is step {} \
+                 ({}: {}). The plan file has been reordered or hand-edited since it was \
+                 written; re-run `plan` to regenerate it.",
+                expected,
+                action.sequence,
+                action.action_type.to_string(),
+                action.description
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 fn split_qualified_name(qualified: &str) -> Result<(String, String)> {
     match qualified.splitn(2, '.').collect::<Vec<&str>>().as_slice() {
         [schema, table] if !schema.is_empty() && !table.is_empty() => {
@@ -138,6 +169,41 @@ mod tests {
         assert!(split_qualified_name(".events").is_err());
         assert!(split_qualified_name("public.").is_err());
         assert!(split_qualified_name("").is_err());
+    }
+
+    fn action(sequence: usize) -> PlanAction {
+        PlanAction {
+            id: format!("action-{}", sequence),
+            action_type: ActionType::CreatePartition,
+            table_name: "public.events".to_string(),
+            description: "Create partitions".to_string(),
+            estimated_duration_secs: Some(1),
+            sequence,
+        }
+    }
+
+    #[test]
+    fn test_verify_action_order_accepts_a_correctly_numbered_plan() {
+        assert!(verify_action_order(&[action(1), action(2), action(3)]).is_ok());
+        assert!(verify_action_order(&[]).is_ok());
+    }
+
+    #[test]
+    fn test_verify_action_order_rejects_a_reordered_plan() {
+        // Swapping two actions in the file leaves the numbers describing an
+        // order the orchestrator would not run.
+        let error = verify_action_order(&[action(2), action(1)])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("position 1"), "{}", error);
+        assert!(error.contains("step 2"), "{}", error);
+    }
+
+    #[test]
+    fn test_verify_action_order_skips_plans_written_before_sequence_existed() {
+        // `sequence` absent from the JSON deserializes as 0 for every action;
+        // those plans must still apply.
+        assert!(verify_action_order(&[action(0), action(0), action(0)]).is_ok());
     }
 
     #[test]

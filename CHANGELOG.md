@@ -9,6 +9,23 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Plans state their execution order.** `PlanAction` gains a 1-based `sequence`, so the order is
+  written into the plan file rather than left to be inferred from array position, and `plan` and
+  `apply --dry-run` print a numbered list:
+
+  ```
+  Execution order:
+    1. create_partition_set — Create public.sessions as PARTITION BY HASH (tenant_id) …
+    2. create_partition — Create 4 hash bucket(s) for public.sessions (MODULUS 4)
+    3. create_index — Recreate public.sessions_template's non-unique indexes on public.sessions
+  ```
+
+  Logs and `partitioner_logbook` now say `Step 4 of 6` instead of a bare action index. The list
+  order remains what actually executes: `apply` checks the numbers against it and refuses a plan
+  file that has been reordered by hand, so the field cannot drift into a second source of truth.
+  A plan written before this field existed has no `sequence` and still applies.
+
+
 - **Range partitioning can now create a new table from a template**, so all three strategies work
   both ways round — the tool has two migrations, and range is no longer stuck in one of them:
 
@@ -139,6 +156,20 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **`partitioner_logbook`'s `timestamp` column is now `created_date`.** `timestamp` is a type name
+  in SQL and needed quoting at every use site. **Breaking for an existing install:** the tool
+  defines the schema but does not migrate it, so a database created before this change has the old
+  column and its `INSERT`s will fail. Drop the table (or the whole `partitioner` schema) and re-run
+  `install`.
+
+- **The `max_locks_per_transaction >= 256` preflight check is gone.** It hard-blocked `plan` on any
+  default-configured server, forcing an `ALTER SYSTEM` and a restart before anything could be
+  planned at all. The threshold bore no relation to a plan's actual size — a cutover with
+  `--premake 12` takes roughly fifteen locks against a default budget of 64. Lock pressure is still
+  reported, by the two signals that measure the real thing: the planner's `large_partition_count`
+  warning, and `inspect`'s headroom signal driven by a table's actual child count.
+
+
 - **`tenant::create_tenant_partition` no longer takes a `tenant_column` argument.** A
   `PARTITION OF … FOR VALUES IN (…)` bound is matched against the column the parent was declared
   `PARTITION BY LIST` on, so the parameter had nowhere to go and was silently ignored. Library API
@@ -171,6 +202,33 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   claimed all roadmap phases were complete and pointed at a document describing removed commands.
 
 ### Fixed
+
+- **A failed migration didn't say what went wrong.** `tokio_postgres::Error`'s `Display` is the
+  fixed string `"db error"` — the message, `DETAIL`, `HINT` and the relation or constraint involved
+  all hang off `as_db_error()`, which nothing called. Worse, the orchestrator's failure log recorded
+  the action id but not the error, so a failed run's log file contained no reason at all. Before:
+
+  ```
+  Error: Batch action 'atomic_cutover' failed (attempt 1): db error (SQLSTATE: 23514)
+  ```
+
+  After:
+
+  ```
+  Error: Batch action 'atomic_cutover' failed (attempt 1): partition constraint of relation
+  "orders_legacy" is violated by some row [relation orders_legacy] (SQLSTATE: 23514)
+  ```
+
+  The same text now reaches the terminal, the log file, and `partitioner_logbook.details`, and the
+  retry paths log it too so a retry storm is diagnosable while it is happening. Note this can carry
+  data values: PostgreSQL puts the offending row into `DETAIL` for some constraint violations, and
+  that will appear in the log file and the audit table.
+
+- **A logbook write that failed was discarded silently.** `append_log`'s result was dropped with
+  `.ok()`, so a logbook that had stopped recording looked identical to one that was working. It
+  stays non-fatal — aborting between two DDL statements is worse than losing an audit row — but is
+  now logged as a warning.
+
 
 - **`plan --format yaml` silently wrote JSON.** The flag was parsed and then never read, so the
   documented `json | yaml` choice had exactly one outcome. `--format yaml` now writes YAML,

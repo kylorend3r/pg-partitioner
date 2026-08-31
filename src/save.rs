@@ -6,7 +6,10 @@ use tokio_postgres::Client;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LogEntry {
     pub id: String,
-    pub timestamp: String,
+    /// Maps to `partitioner_logbook.created_date`. Named for the column rather
+    /// than `timestamp`, which is a type name in SQL and had to be quoted at
+    /// every use site.
+    pub created_date: String,
     pub action: String,
     pub table_name: String,
     pub status: LogStatus,
@@ -38,20 +41,20 @@ pub async fn create_logbook_table(client: &Client) -> Result<()> {
         CREATE SCHEMA IF NOT EXISTS partitioner;
         CREATE TABLE IF NOT EXISTS partitioner.partitioner_logbook (
             id SERIAL PRIMARY KEY,
-            -- Stored as text (RFC3339), not TIMESTAMP: tokio-postgres is built
+            -- Stored as text (RFC3339), not a TIMESTAMP: tokio-postgres is built
             -- here without chrono support, so binding a Rust String against a
             -- `::timestamp`-cast parameter (or reading a TIMESTAMP column back
             -- into a String) fails — same class of mismatch already worked
             -- around in registrations.rs's registered_at column.
-            timestamp VARCHAR(64) NOT NULL,
+            created_date VARCHAR(64) NOT NULL,
             action VARCHAR(64) NOT NULL,
             table_name VARCHAR(128) NOT NULL,
             status VARCHAR(16) NOT NULL,
             details TEXT,
             duration_ms INTEGER
         );
-        CREATE INDEX IF NOT EXISTS idx_partitioner_logbook_timestamp
-            ON partitioner.partitioner_logbook(timestamp DESC);
+        CREATE INDEX IF NOT EXISTS idx_partitioner_logbook_created_date
+            ON partitioner.partitioner_logbook(created_date DESC);
         CREATE INDEX IF NOT EXISTS idx_partitioner_logbook_table
             ON partitioner.partitioner_logbook(table_name);
     "#;
@@ -62,7 +65,7 @@ pub async fn create_logbook_table(client: &Client) -> Result<()> {
 
 pub async fn append_log(client: &Client, entry: &LogEntry) -> Result<()> {
     let query = r#"
-        INSERT INTO partitioner.partitioner_logbook (timestamp, action, table_name, status, details, duration_ms)
+        INSERT INTO partitioner.partitioner_logbook (created_date, action, table_name, status, details, duration_ms)
         VALUES ($1, $2, $3, $4, $5, $6)
     "#;
 
@@ -70,7 +73,7 @@ pub async fn append_log(client: &Client, entry: &LogEntry) -> Result<()> {
         .execute(
             query,
             &[
-                &entry.timestamp,
+                &entry.created_date,
                 &entry.action,
                 &entry.table_name,
                 &entry.status.as_str(),
@@ -93,18 +96,18 @@ pub async fn get_recent_logs(
     // then dropped.
     let rows = if let Some(table) = table_name {
         let query = r#"
-            SELECT id, timestamp, action, table_name, status, details, duration_ms
+            SELECT id, created_date, action, table_name, status, details, duration_ms
             FROM partitioner.partitioner_logbook
             WHERE table_name = $1
-            ORDER BY timestamp DESC
+            ORDER BY created_date DESC
             LIMIT $2
         "#;
         client.query(query, &[&table, &limit]).await?
     } else {
         let query = r#"
-            SELECT id, timestamp, action, table_name, status, details, duration_ms
+            SELECT id, created_date, action, table_name, status, details, duration_ms
             FROM partitioner.partitioner_logbook
-            ORDER BY timestamp DESC
+            ORDER BY created_date DESC
             LIMIT $1
         "#;
         client.query(query, &[&limit]).await?
@@ -123,7 +126,7 @@ pub async fn get_recent_logs(
 
         entries.push(LogEntry {
             id: format!("{}", row.get::<_, i32>(0)),
-            timestamp: row.get::<_, String>(1),
+            created_date: row.get::<_, String>(1),
             action: row.get(2),
             table_name: row.get(3),
             status,
@@ -143,7 +146,7 @@ pub fn create_log_entry(
 ) -> LogEntry {
     LogEntry {
         id: uuid::Uuid::new_v4().to_string(),
-        timestamp: Utc::now().to_rfc3339(),
+        created_date: Utc::now().to_rfc3339(),
         action,
         table_name,
         status,

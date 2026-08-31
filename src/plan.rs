@@ -122,6 +122,7 @@ impl Planner {
                     schema, table
                 ),
                 estimated_duration_secs: Some(1),
+                sequence: 0,
             },
             PlanAction {
                 id: Uuid::new_v4().to_string(),
@@ -129,6 +130,7 @@ impl Planner {
                 table_name: table_name.clone(),
                 description: format!("Validate bounding CHECK constraint on {}.{}", schema, table),
                 estimated_duration_secs: Some(5),
+                sequence: 0,
             },
             PlanAction {
                 id: Uuid::new_v4().to_string(),
@@ -136,6 +138,7 @@ impl Planner {
                 table_name: table_name.clone(),
                 description: format!("Create partitioned shadow table for {}.{}", schema, table),
                 estimated_duration_secs: Some(1),
+                sequence: 0,
             },
             PlanAction {
                 id: Uuid::new_v4().to_string(),
@@ -146,6 +149,7 @@ impl Planner {
                     schema, table
                 ),
                 estimated_duration_secs: Some(1),
+                sequence: 0,
             },
             PlanAction {
                 id: Uuid::new_v4().to_string(),
@@ -156,6 +160,7 @@ impl Planner {
                     config.premake_count, schema, table
                 ),
                 estimated_duration_secs: Some(1),
+                sequence: 0,
             },
             PlanAction {
                 id: Uuid::new_v4().to_string(),
@@ -166,6 +171,7 @@ impl Planner {
                     schema, table
                 ),
                 estimated_duration_secs: Some(1),
+                sequence: 0,
             },
         ];
 
@@ -177,7 +183,7 @@ impl Planner {
             created_at: chrono::Utc::now().to_rfc3339(),
             database: get_database_name(client).await.unwrap_or_default(),
             schema_checksum,
-            actions,
+            actions: sequenced(actions),
             migration_config: Some(config.clone()),
             checksum_table: None,
             warnings,
@@ -312,6 +318,7 @@ impl Planner {
                         template
                     ),
                     estimated_duration_secs: Some(1),
+                    sequence: 0,
                 }];
 
                 match config.partition_strategy {
@@ -326,6 +333,7 @@ impl Planner {
                                 modulus, table_name, modulus
                             ),
                             estimated_duration_secs: Some(1),
+                            sequence: 0,
                         });
                     }
                     PartitionStrategy::Range => {
@@ -342,6 +350,7 @@ impl Planner {
                                 config.interval
                             ),
                             estimated_duration_secs: Some(1),
+                            sequence: 0,
                         });
                     }
                     // Children arrive later, via `add-partition`.
@@ -357,6 +366,7 @@ impl Planner {
                         template, table_name
                     ),
                     estimated_duration_secs: Some(1),
+                    sequence: 0,
                 });
 
                 actions
@@ -385,7 +395,7 @@ impl Planner {
             created_at: chrono::Utc::now().to_rfc3339(),
             database: get_database_name(client).await.unwrap_or_default(),
             schema_checksum,
-            actions,
+            actions: sequenced(actions),
             migration_config: Some(config.clone()),
             checksum_table: Some(template.to_string()),
             warnings,
@@ -456,6 +466,7 @@ impl Planner {
                 crate::migration::format_list_values(values)
             ),
             estimated_duration_secs: Some(1),
+            sequence: 0,
         }];
 
         let schema_checksum = compute_schema_checksum(client, schema, table).await?;
@@ -465,12 +476,25 @@ impl Planner {
             created_at: chrono::Utc::now().to_rfc3339(),
             database: get_database_name(client).await.unwrap_or_default(),
             schema_checksum,
-            actions,
+            actions: sequenced(actions),
             migration_config: Some(config),
             checksum_table: None,
             warnings,
         })
     }
+}
+
+/// Stamps 1-based execution order onto a finished action list.
+///
+/// Numbering lives here rather than at each `PlanAction` literal so a new
+/// action cannot be added without one, and so the numbers can never disagree
+/// with the list order they are derived from. The list itself stays
+/// authoritative — `apply` re-checks these against it before executing.
+fn sequenced(mut actions: Vec<PlanAction>) -> Vec<PlanAction> {
+    for (index, action) in actions.iter_mut().enumerate() {
+        action.sequence = index + 1;
+    }
+    actions
 }
 
 /// Splits validation output into hard blockers and advisory warnings.
@@ -572,6 +596,44 @@ async fn get_database_name(client: &Client) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn numbering_fixture(name: &str) -> PlanAction {
+        PlanAction {
+            id: name.to_string(),
+            action_type: crate::types::ActionType::CreatePartition,
+            table_name: "public.events".to_string(),
+            description: name.to_string(),
+            estimated_duration_secs: Some(1),
+            sequence: 0,
+        }
+    }
+
+    #[test]
+    fn test_sequenced_numbers_from_one_in_list_order() {
+        let numbered = sequenced(vec![
+            numbering_fixture("a"),
+            numbering_fixture("b"),
+            numbering_fixture("c"),
+        ]);
+
+        assert_eq!(
+            numbered.iter().map(|a| a.sequence).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        // The numbering describes the list; it must never reorder it, since the
+        // list is what the orchestrator actually executes.
+        assert_eq!(
+            numbered.iter().map(|a| a.id.as_str()).collect::<Vec<_>>(),
+            vec!["a", "b", "c"]
+        );
+    }
+
+    #[test]
+    fn test_sequenced_handles_an_empty_plan() {
+        // The template flow emits no actions when the target already matches,
+        // and that plan still has to serialize.
+        assert!(sequenced(Vec::new()).is_empty());
+    }
 
     #[test]
     fn test_plan_creation() {

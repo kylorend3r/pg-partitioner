@@ -59,7 +59,16 @@ impl Orchestrator {
 
         let mut results = Vec::new();
 
+        let total = actions.len();
+
         for (idx, action) in actions.iter().enumerate() {
+            // Prefer the plan's own numbering; fall back to position for a plan
+            // file written before `sequence` existed.
+            let step = if action.sequence == 0 {
+                idx + 1
+            } else {
+                action.sequence
+            };
             let start_time = Instant::now();
 
             let result = self
@@ -70,8 +79,16 @@ impl Orchestrator {
 
             // Log the action
             let (status, details, error_msg) = match &result {
-                Ok(_) => (LogStatus::Success, "Action completed successfully".to_string(), None),
-                Err(e) => (LogStatus::Failed, format!("Action failed: {}", e), Some(e.to_string())),
+                Ok(_) => (
+                    LogStatus::Success,
+                    format!("Step {} of {} completed successfully", step, total),
+                    None,
+                ),
+                Err(e) => (
+                    LogStatus::Failed,
+                    format!("Step {} of {} failed: {}", step, total, e),
+                    Some(e.to_string()),
+                ),
             };
 
             let log_entry = save::create_log_entry(
@@ -84,7 +101,18 @@ impl Orchestrator {
             let mut log_with_duration = log_entry;
             log_with_duration.duration_ms = Some(duration_ms);
 
-            save::append_log(client, &log_with_duration).await.ok();
+            if let Err(e) = save::append_log(client, &log_with_duration).await {
+                // Deliberately non-fatal: losing the audit trail is bad, but
+                // aborting between two DDL statements is worse. Logged rather
+                // than discarded so a logbook that has stopped recording is
+                // visible instead of silent.
+                warn!(
+                    step = step,
+                    action_id = action.id,
+                    error = %e,
+                    "Failed to append to partitioner_logbook; continuing"
+                );
+            }
 
             results.push(ExecutionResult {
                 action_id: action.id.clone(),
@@ -96,22 +124,28 @@ impl Orchestrator {
                 error: error_msg,
             });
 
-            // Stop on first failure
-            if result.is_err() {
-                error!(
-                    action_index = idx,
+            // Stop on first failure.
+            match result {
+                Err(e) => {
+                    error!(
+                        step = step,
+                        total = total,
+                        action_id = action.id,
+                        action_type = action.action_type.to_string(),
+                        table = action.table_name,
+                        error = %e,
+                        "Stopping due to action failure"
+                    );
+                    return Err(e);
+                }
+                Ok(_) => info!(
+                    step = step,
+                    total = total,
                     action_id = action.id,
-                    "Stopping due to action failure"
-                );
-                return Err(result.err().unwrap());
+                    duration_ms = duration_ms,
+                    "Action completed"
+                ),
             }
-
-            info!(
-                action_index = idx,
-                action_id = action.id,
-                duration_ms = duration_ms,
-                "Action completed"
-            );
         }
 
         Ok(results)
