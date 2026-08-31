@@ -42,9 +42,6 @@ pub async fn validate_table_for_partitioning(
     // Check for unique indexes without partition key
     errors.extend(validate_unique_constraints(client, schema, table, &config.partition_key).await?);
 
-    // Check max_locks_per_transaction headroom
-    errors.extend(validate_lock_budget(client).await?);
-
     // Check for timezone mismatches
     errors.extend(validate_timezone_compatibility(client, &config.partition_key).await?);
 
@@ -421,7 +418,6 @@ pub async fn validate_template_creation(
             .await?,
     );
 
-    errors.extend(validate_lock_budget(client).await?);
     errors.extend(validate_timezone_compatibility(client, &config.partition_key).await?);
 
     Ok(errors)
@@ -533,31 +529,6 @@ pub async fn validate_add_list_partition(
                 });
             }
         }
-    }
-
-    Ok(errors)
-}
-
-async fn validate_lock_budget(client: &Client) -> Result<Vec<ValidationError>> {
-    let mut errors = Vec::new();
-
-    let row = client
-        .query_one("SELECT current_setting('max_locks_per_transaction')::int", &[])
-        .await?;
-
-    let max_locks: i32 = row.get(0);
-
-    if max_locks < 256 {
-        errors.push(ValidationError {
-            category: "max_locks_insufficient".to_string(),
-            message: format!(
-                "max_locks_per_transaction is set to {} (minimum 256 recommended for partitioning)",
-                max_locks
-            ),
-            suggestion: Some(
-                "Consider raising max_locks_per_transaction in postgresql.conf".to_string(),
-            ),
-        });
     }
 
     Ok(errors)

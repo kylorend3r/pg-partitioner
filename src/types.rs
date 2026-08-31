@@ -133,6 +133,17 @@ pub struct PlanAction {
     pub table_name: String,
     pub description: String,
     pub estimated_duration_secs: Option<u32>,
+    /// 1-based position in the plan's execution order, stamped by `plan.rs`'s
+    /// `sequenced` once the action list is final.
+    ///
+    /// The list's own order is what the orchestrator actually executes; this
+    /// field exists so a plan file states that order rather than leaving it to
+    /// be inferred from array position, and so a failure can name the step.
+    /// `#[serde(default)]` leaves it `0` on plan files written before this
+    /// existed, which `apply`'s order check reads as "unset" rather than as a
+    /// real position.
+    #[serde(default)]
+    pub sequence: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

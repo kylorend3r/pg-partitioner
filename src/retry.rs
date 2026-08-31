@@ -94,6 +94,7 @@ pub async fn execute_with_retry(
                             attempt = attempt,
                             max_attempts = policy.max_attempts,
                             backoff_ms = backoff_ms,
+                            error = %describe_chain(&e),
                             "Lock not acquired, retrying"
                         );
                         sleep(Duration::from_millis(backoff_ms as u64)).await;
@@ -110,6 +111,7 @@ pub async fn execute_with_retry(
                             attempt = attempt,
                             max_attempts = policy.max_attempts,
                             backoff_ms = backoff_ms,
+                            error = %describe_chain(&e),
                             "Deadlock detected, retrying (indicates conflicting lock orders)"
                         );
                         sleep(Duration::from_millis(backoff_ms as u64)).await;
@@ -122,7 +124,7 @@ pub async fn execute_with_retry(
                     "Action '{}' failed (attempt {}): {} (SQLSTATE: {})",
                     action.name,
                     attempt,
-                    e,
+                    describe_chain(&e),
                     error_code.unwrap_or_else(|| "unknown".to_string())
                 ));
             }
@@ -176,6 +178,7 @@ pub async fn execute_batch_with_retry(
                             attempt = attempt,
                             max_attempts = policy.max_attempts,
                             backoff_ms = backoff_ms,
+                            error = %describe(&e),
                             "Lock not acquired, retrying batch"
                         );
                         sleep(Duration::from_millis(backoff_ms as u64)).await;
@@ -191,6 +194,7 @@ pub async fn execute_batch_with_retry(
                             attempt = attempt,
                             max_attempts = policy.max_attempts,
                             backoff_ms = backoff_ms,
+                            error = %describe(&e),
                             "Deadlock detected, retrying batch (indicates conflicting lock orders)"
                         );
                         sleep(Duration::from_millis(backoff_ms as u64)).await;
@@ -202,7 +206,7 @@ pub async fn execute_batch_with_retry(
                     "Batch action '{}' failed (attempt {}): {} (SQLSTATE: {})",
                     name,
                     attempt,
-                    e,
+                    describe(&e),
                     error_code.unwrap_or_else(|| "unknown".to_string())
                 ));
             }
@@ -252,20 +256,144 @@ fn calculate_backoff(attempt_index: u32, policy: &RetryPolicy) -> u32 {
 }
 
 fn extract_sqlstate(error: &anyhow::Error) -> Option<String> {
+    db_error_from_chain(error).and_then(|e| e.code().map(|c| c.code().to_string()))
+}
+
+/// Finds the driver error inside an `anyhow` chain.
+///
+/// `execute_with_retry` works with `anyhow::Error` while `execute_batch_with_retry`
+/// holds the `tokio_postgres::Error` directly, so everything that wants the
+/// server's own reporting has to come back through here first.
+fn db_error_from_chain(error: &anyhow::Error) -> Option<&tokio_postgres::error::Error> {
     error
         .chain()
-        .find_map(|e| {
-            if let Some(db_error) = e.downcast_ref::<tokio_postgres::error::Error>() {
-                db_error.code().map(|c| c.code().to_string())
-            } else {
-                None
-            }
-        })
+        .find_map(|e| e.downcast_ref::<tokio_postgres::error::Error>())
+}
+
+/// Assembles the parts of a server error report into one line.
+///
+/// Pure on purpose: `DbError` has no public constructor, so the only way to test
+/// this rendering is to keep it separate from the field extraction that reads it
+/// (CLAUDE.md §4.1). `format_db_error` below is the two-line adapter.
+fn render_db_error_parts(
+    message: &str,
+    detail: Option<&str>,
+    hint: Option<&str>,
+    relation: Option<&str>,
+    constraint: Option<&str>,
+) -> String {
+    let mut rendered = message.to_string();
+
+    // Ordered the way psql prints them, most specific context last.
+    if let Some(relation) = relation {
+        match constraint {
+            Some(constraint) => rendered.push_str(&format!(
+                " [relation {}, constraint {}]",
+                relation, constraint
+            )),
+            None => rendered.push_str(&format!(" [relation {}]", relation)),
+        }
+    } else if let Some(constraint) = constraint {
+        rendered.push_str(&format!(" [constraint {}]", constraint));
+    }
+
+    if let Some(detail) = detail {
+        rendered.push_str(&format!(" DETAIL: {}", detail));
+    }
+
+    if let Some(hint) = hint {
+        rendered.push_str(&format!(" HINT: {}", hint));
+    }
+
+    rendered
+}
+
+/// What the server actually said.
+///
+/// `tokio_postgres::Error`'s own `Display` is the fixed string "db error" — the
+/// message, DETAIL, HINT and the relation or constraint involved all hang off
+/// `as_db_error()` and are otherwise dropped. That is why a failed cutover used
+/// to report nothing beyond `SQLSTATE: 23514`, leaving an operator to reproduce
+/// the DDL by hand to find out what was wrong.
+///
+/// Note this can carry data values: PostgreSQL puts the offending row into
+/// DETAIL for some constraint violations, and that reaches the log file and
+/// `partitioner_logbook`. Kept, because it is usually the line that identifies
+/// the problem row.
+fn format_db_error(error: &tokio_postgres::error::Error) -> Option<String> {
+    let db_error = error.as_db_error()?;
+
+    Some(render_db_error_parts(
+        db_error.message(),
+        db_error.detail(),
+        db_error.hint(),
+        db_error.table(),
+        db_error.constraint(),
+    ))
+}
+
+/// The driver error rendered for a human, falling back to its `Display` when the
+/// failure was not a server-side error at all (a broken connection, say).
+fn describe(error: &tokio_postgres::error::Error) -> String {
+    format_db_error(error).unwrap_or_else(|| error.to_string())
+}
+
+/// Same, for the `anyhow`-wrapped side of the module.
+fn describe_chain(error: &anyhow::Error) -> String {
+    db_error_from_chain(error)
+        .and_then(format_db_error)
+        .unwrap_or_else(|| error.to_string())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_render_db_error_parts_message_only() {
+        assert_eq!(
+            render_db_error_parts("relation \"events\" does not exist", None, None, None, None),
+            "relation \"events\" does not exist"
+        );
+    }
+
+    #[test]
+    fn test_render_db_error_parts_includes_every_field_the_server_sent() {
+        // The real shape of the failure this was written for: a violated
+        // partition constraint names the relation, and DETAIL identifies the row.
+        let rendered = render_db_error_parts(
+            "partition constraint is violated by some row",
+            Some("Failing row contains (1, null)"),
+            Some("Add a NOT NULL constraint"),
+            Some("orders_legacy"),
+            Some("orders_partition_check"),
+        );
+
+        assert!(rendered.starts_with("partition constraint is violated by some row"));
+        for expected in [
+            "orders_legacy",
+            "orders_partition_check",
+            "Failing row contains",
+            "Add a NOT NULL constraint",
+        ] {
+            assert!(
+                rendered.contains(expected),
+                "{} missing from {}",
+                expected,
+                rendered
+            );
+        }
+    }
+
+    #[test]
+    fn test_render_db_error_parts_omits_absent_fields() {
+        // A server error with no DETAIL must not render an empty "DETAIL:".
+        let rendered = render_db_error_parts("deadlock detected", None, None, Some("events"), None);
+        assert!(rendered.contains("events"), "{}", rendered);
+        assert!(!rendered.contains("DETAIL"), "{}", rendered);
+        assert!(!rendered.contains("HINT"), "{}", rendered);
+        assert!(!rendered.contains("constraint"), "{}", rendered);
+    }
 
     #[test]
     fn test_calculate_backoff_no_jitter() {

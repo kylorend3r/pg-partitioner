@@ -162,6 +162,23 @@ include the partition key.
 
 This is expected, not a blocker — PostgreSQL requires unique indexes on a partitioned table to include the partition key, so `apply` automatically **skips** recreating that specific index on the new parent (everything else gets recreated) and leaves the original constraint enforced only on the now-archived legacy partition. If you need a true partition-wide unique constraint, that's a separate, not-yet-automated step (redefine the index to include `created_at`, e.g. `UNIQUE (id, created_at)`).
 
+`plan` also prints the order the actions will run in, and writes it into the plan file as each
+action's `sequence`:
+
+```
+Execution order:
+  1. add_constraint — Add NOT VALID bounding CHECK constraint on public.events
+  2. validate_constraint — Validate bounding CHECK constraint on public.events
+  3. create_partition_set — Create partitioned shadow table for public.events
+  4. attach_partition — Atomic rename-rename-attach cutover for public.events
+  5. create_partition — Create default partition + 3 forward-looking partition(s) for public.events
+  6. create_index — Recreate non-unique indexes on the new parent for public.events
+```
+
+If a step fails, logs and `partitioner_logbook` name it the same way (`Step 4 of 6 failed: …`).
+The list order is what actually executes, so `apply` checks the numbers against it and refuses a
+plan file whose actions have been reordered by hand.
+
 ```bash
 # 3. Dry-run, then apply for real
 pg-partitioner apply --plan-file plan.json --dry-run
